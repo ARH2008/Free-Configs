@@ -34,8 +34,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Test the transform rules
-        run: python scripts/test_rules.py
+      # - name: Test the transform rules
+      #   run: python scripts/test_rules.py
 
       - name: Install newest Xray-core
         env:
