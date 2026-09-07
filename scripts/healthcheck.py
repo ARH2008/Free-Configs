@@ -71,12 +71,15 @@ class TestEndpoint(NamedTuple):
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 TEST_ENDPOINTS: tuple[TestEndpoint, ...] = (
+    # Test 1: Check if the API works
     TestEndpoint("generativelanguage.googleapis.com", f"/v1beta/models?key={GEMINI_API_KEY}", (200,)),
+    # Test 2: Check if the Web UI works (Accepts 200 OK or Redirects)
+    TestEndpoint("aistudio.google.com", "/", (200, 301, 302, 307)),
 )
 ENDPOINT_CHECK_TIMEOUT = 10.0
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 
-ROUNDS = 1                 # a node must pass every round
+ROUNDS = 2                 # a node must pass every round
 REQUEST_TIMEOUT = 5.0      # seconds, matches upstream's 5000ms budget
 # These two are independent, and were measured separately on 192 nodes.
 #
@@ -404,7 +407,12 @@ def _probe(port: int, endpoint: TestEndpoint) -> tuple[bool, float]:
             "GET", endpoint.path, headers={"User-Agent": USER_AGENT, "Connection": "close"}
         )
         response = connection.getresponse()
-        response.read()
+        body = response.read() # <-- We save the HTML body to a variable now
+        
+        # NEW: Check if Google is redirecting us to the blocked region page
+        if b"available-regions" in body:
+            return False, (time.monotonic() - started) * 1000.0
+            
         elapsed = (time.monotonic() - started) * 1000.0
         return response.status in endpoint.statuses, elapsed
     except Exception:
