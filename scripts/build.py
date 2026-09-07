@@ -247,6 +247,18 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
             )
         ),
     ]
+    # Say plainly what was tested and what was not: fm and dialMode go on after
+    # the check, so the criterion above is a claim about the nodes, not about
+    # the masking they ship with.
+    deferred = [
+        name
+        for name, key in (("fm", "published_with_fm"), ("dialMode", "published_with_dial_mode"))
+        if counts.get(key)
+    ]
+    if deferred:
+        header.append(
+            f"# {' and '.join(deferred)} applied after testing, to nodes that had already passed"
+        )
     if "flaky_percent" in counts:
         header.append(
             f"# {counts['flaky_percent']}% of nodes that worked at least once"
@@ -316,7 +328,7 @@ def main() -> int:
         )
         return 1
 
-    print("Applying rules 1-13")
+    print("Applying rules 1-12 (pre-health-check)")
     transformed = transform.transform(nodes, counts)
     for key in (
         "dropped_vmess_cannot_carry_fm",
@@ -371,6 +383,21 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Only now do the survivors become publishable links: fm and dialMode were
+    # withheld so the health check measured the nodes rather than the masking,
+    # and the output endpoint is a separate setting from the tested one.
+    transform.finalise(healthy, counts)
+    extras = [
+        name
+        for name, value in (("fm", transform.FM), ("dialMode", transform.DIAL_MODE))
+        if value
+    ]
+    print(
+        f"Finalising {len(healthy)} nodes: "
+        + (f"adding {' and '.join(extras)}, " if extras else "")
+        + f"publishing on {transform.OUTPUT_ADDRESS}:{transform.OUTPUT_PORT}"
+    )
 
     links = [node.to_link() for node in healthy]
     output_path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)

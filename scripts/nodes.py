@@ -49,6 +49,7 @@ PARAM_ORDER = (
     "fp",
     "cs",
     "fm",
+    "dialMode",
     "flow",
     "headerType",
     "packetEncoding",
@@ -213,9 +214,13 @@ class Node:
     def to_outbound(self, tag: str) -> dict:
         """Render this node as an Xray-core outbound object.
 
-        Mirrors the emitted share link exactly, including ``fm`` (finalmask),
-        ``cs`` (cipherSuites) and ``fp`` (fingerprint), so the health check
-        exercises the same configuration the subscription hands to the client.
+        Mirrors whatever the node carries, including the share-link extensions
+        ``fp`` (fingerprint), ``cs`` (cipherSuites), ``fm`` (finalmask) and
+        ``dialMode`` (a sockopt). Which of those are present depends on the
+        stage: the health check runs on nodes that carry fp and cs but not fm
+        or dialMode, and transform.finalise adds the other two to the
+        survivors. See scripts/transform.py for why the pipeline is split that
+        way.
         """
         net = self.transport
         stream: dict = {"network": "ws" if net in WS_ALIASES else net}
@@ -256,6 +261,13 @@ class Node:
             # Raises if the value is not valid JSON; build.py surfaces that as
             # a hard failure rather than emitting configs Xray would reject.
             stream["finalmask"] = json.loads(self.get("fm"))
+
+        if self.get("dialMode"):
+            # A fork-only sockopt (streamSettings.sockopt.dialMode) selecting
+            # which dialing code the core runs. Passed through as-is: the core
+            # accepts any string here at parse time and only rejects one it has
+            # no implementation for when it dials.
+            stream["sockopt"] = {"dialMode": self.get("dialMode")}
 
         port = int(self.port)
         if self.scheme == "vless":

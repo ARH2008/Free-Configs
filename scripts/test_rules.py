@@ -64,6 +64,13 @@ def survives(**kwargs) -> bool:
     return len(one(**kwargs)) > 0
 
 
+def finalised(**kwargs) -> list[Node]:
+    """Run the whole pipeline over one synthetic link: the pre-health-check
+    transform, then the post-health-check finalise, exactly as build.py does
+    for a node that passed."""
+    return transform.finalise(one(**kwargs), {})
+
+
 BASE = dict(security="tls", type="ws", host="a.example", path="/")
 
 
@@ -77,7 +84,13 @@ check(survives(security=None, type="ws", host="a.example", port="8080"), "rule 1
 
 # --- rule 2: transport -----------------------------------------------------
 
-for value in transform.ALLOWED_TRANSPORTS:
+# Spelled out rather than read from ALLOWED_TRANSPORTS: looping over the
+# constant would shrink silently with it, so dropping a transport from the
+# pipeline would pass unnoticed.
+check(set(transform.ALLOWED_TRANSPORTS)
+      == {"ws", "xhttp", "websocket", "httpupgrade", "grpc"},
+      "rule 2: the accepted transports are the five in the spec")
+for value in ("ws", "xhttp", "websocket", "httpupgrade", "grpc"):
     check(survives(**{**BASE, "type": value}), f"rule 2: type={value!r} should survive")
 for value in ("tcp", "raw", "kcp", "h2", ""):
     check(not survives(**{**BASE, "type": value}), f"rule 2: type={value!r} should drop")
@@ -156,15 +169,52 @@ transform.rule_9_convert_to_tls(already)
 check(already.port == "443" and already.get("sni") == "orig.example",
       "rule 9 isolated: a node already on 443 is left alone")
 
-# --- rule 10: exit address -------------------------------------------------
+# --- rule 10: endpoints ----------------------------------------------------
 
 for node in one(**BASE):
-    check(node.address == transform.EXIT_ADDRESS, "rule 10: the node uses the exit address")
+    check(node.address == transform.HEALTHCHECK_ADDRESS,
+          "rule 10: a node about to be tested uses the health-check address")
+    check(node.port == transform.HEALTHCHECK_PORT,
+          "rule 10: a node about to be tested uses the health-check port")
+
+for node in finalised(**BASE):
+    check(node.address == transform.OUTPUT_ADDRESS,
+          "rule 10: a published node uses the output address")
+    check(node.port == transform.OUTPUT_PORT,
+          "rule 10: a published node uses the output port")
 
 probe = parse_line(link(**BASE))
-probe.address = "0.0.0.0"
-transform.rule_10_set_address(probe)
-check(probe.address == transform.EXIT_ADDRESS, "rule 10: the setter applies the exit address")
+probe.address, probe.port = "0.0.0.0", "1"
+transform.rule_10_point_at_healthcheck(probe)
+check(probe.address == transform.HEALTHCHECK_ADDRESS
+      and probe.port == transform.HEALTHCHECK_PORT,
+      "rule 10: the setter applies the health-check endpoint")
+transform.rule_10_point_at_output(probe)
+check(probe.address == transform.OUTPUT_ADDRESS and probe.port == transform.OUTPUT_PORT,
+      "rule 10: the setter applies the output endpoint")
+
+# The two endpoints are genuinely independent. Patched rather than assumed:
+# they hold the same values today, so an equality test would still pass if one
+# phase were wired to the other phase's constants.
+real_endpoints = (
+    transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT,
+    transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT,
+)
+try:
+    transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT = "10.0.0.1", "8443"
+    transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT = "10.0.0.2", "2053"
+    tested = one(**BASE)
+    check([(n.address, n.port) for n in tested] == [("10.0.0.1", "8443")],
+          "rule 10: the tested endpoint comes from the health-check constants")
+    published = transform.finalise(tested, {})
+    check([(n.address, n.port) for n in published] == [("10.0.0.2", "2053")],
+          "rule 10: the published endpoint comes from the output constants")
+    check(published[0].to_link().startswith("vless://")
+          and "@10.0.0.2:2053?" in published[0].to_link(),
+          "rule 10: the output address and port reach the emitted link")
+finally:
+    (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT,
+     transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT) = real_endpoints
 
 # --- rule 11: strip certificate opt-outs -----------------------------------
 
@@ -189,21 +239,65 @@ for node in survivor:
           "rule 11: stripping ech leaves the other parameters intact")
 check(len(survivor) == 1, "rule 11: stripping ech does not drop the node")
 
+# --- deferred parameters: fm and dialMode are withheld from the check -------
+
+for spelling in ("fm", "FM", "Fm", "dialMode", "dialmode", "DIALMODE"):
+    tested = one(**{**BASE, spelling: "junk-from-a-source"})
+    check(len(tested) == 1, f"deferred: a node carrying {spelling} is not dropped")
+    for node in tested:
+        check(not node.has(spelling),
+              f"deferred: {spelling} is removed before the health check")
+        check("junk-from-a-source" not in node.to_link(),
+              f"deferred: a source value for {spelling} never reaches the tested link")
+
+# What a source supplied is replaced by this project's value, never merged.
+for node in transform.finalise(one(**{**BASE, "fm": "junk", "dialMode": "junk"}), {}):
+    check(node.get("fm") == transform.FM, "deferred: the published fm is this project's")
+    check(node.get("dialMode") == transform.DIAL_MODE,
+          "deferred: the published dialMode is this project's")
+
+# The invariant the whole split exists for: nothing reaching the health check
+# carries either parameter, whatever it arrived with, and everything reaching
+# it still carries the masking the check is supposed to exercise.
+matrix = []
+for security, port in (("tls", "443"), ("none", "8080"), ("tls", "2053"), ("none", "2082")):
+    for extra in ({}, {"fm": "x"}, {"dialMode": "x"}, {"fm": "x", "dialMode": "x"}):
+        matrix.extend(one(**{**BASE, "security": security, "port": port, **extra}))
+check(len(matrix) == 16, "deferred: every combination in the matrix survived the rules")
+check(all(not n.has("fm") and not n.has("dialMode") for n in matrix),
+      "deferred: no node reaches the health check carrying fm or dialMode")
+check(all("fm=" not in n.to_link() and "dialMode=" not in n.to_link() for n in matrix),
+      "deferred: no tested link carries fm or dialMode")
+check(all(n.get("fp") == transform.FP and n.get("cs") == transform.CS for n in matrix),
+      "deferred: every tested node still carries fp and cs")
+check(all(n.port == transform.HEALTHCHECK_PORT and n.security == "tls" for n in matrix),
+      "deferred: every tested node is TLS on the health-check port")
+
 # --- rule 12: masking parameters -------------------------------------------
+# fp and cs go on before the health check, because they shape the TLS handshake
+# the check has to succeed at. fm goes on after -- see the section above.
 
 for node in one(**BASE):
     check(node.get("fp") == "unsafe", "rule 12: fp=unsafe")
-    check(node.get("fm") == transform.FM_443, "rule 12: fm value")
-    check(node.get("cs") == transform.CS_443, "rule 12: cs value")
+    check(node.get("cs") == transform.CS, "rule 12: cs value")
+    check(not node.has("fm"), "rule 12: fm is not applied before the check")
     emitted = node.to_link()
-    check(transform.FM_443_ENCODED in emitted, "rule 12: fm is byte-exact in the link")
-    check(transform.CS_443_ENCODED in emitted, "rule 12: cs is byte-exact in the link")
-    check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the link")
+    check(transform.CS_ENCODED in emitted, "rule 12: cs is byte-exact in the tested link")
+    check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the tested link")
+
+for node in finalised(**BASE):
+    check(node.get("fm") == transform.FM, "rule 12: fm value on a published node")
+    check(node.get("fp") == "unsafe" and node.get("cs") == transform.CS,
+          "rule 12: finalising leaves fp and cs alone")
+    emitted = node.to_link()
+    check(transform.FM_ENCODED in emitted, "rule 12: fm is byte-exact in the published link")
+    check(transform.CS_ENCODED in emitted, "rule 12: cs is byte-exact in the published link")
+    check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the published link")
 
 # A converted plaintext node gets the same masking as any other.
-for node in one(security="none", type="ws", host="d.example", path="/", port="8080"):
-    check(node.get("fp") == "unsafe" and node.get("fm") == transform.FM_443
-          and node.get("cs") == transform.CS_443,
+for node in finalised(security="none", type="ws", host="d.example", path="/", port="8080"):
+    check(node.get("fp") == "unsafe" and node.get("fm") == transform.FM
+          and node.get("cs") == transform.CS,
           "rule 12: a converted node is masked like any other")
 
 # A node arriving with stale TLS parameters has them overwritten by rule 12
@@ -215,13 +309,86 @@ inherited = one(
 check(len(inherited) == 1, "rule 12: a converted node is still a single node")
 converted = inherited[0]
 check(converted.get("fp") == "unsafe", "rule 12: a stale fp is overwritten")
-check(converted.get("cs") == transform.CS_443, "rule 12: a stale cs is overwritten")
+check(converted.get("cs") == transform.CS, "rule 12: a stale cs is overwritten")
 check(converted.get("sni") == "c.example", "rule 12: a stale sni is replaced by the host")
 
+# The same for a node that was already TLS on 443 and so never went through
+# rule 9 -- rule 12 is the only thing that can correct its sni, and it must,
+# because rule 10 has just replaced the address with a Cloudflare IP.
+for node in one(**{**BASE, "sni": "stale.example"}):
+    check(node.get("sni") == "a.example",
+          "rule 12: a stale sni on an already-TLS node is replaced by the host")
+for node in one(security="tls", type="ws", host="e.example", path="/", port="443"):
+    check(node.get("sni") == "e.example",
+          "rule 12: a node with no sni at all is given the host")
+
 # Existing values must be overwritten, not kept ("set/change").
-for node in one(**{**BASE, "fp": "chrome", "fm": "junk", "cs": "junk"}):
+for node in finalised(**{**BASE, "fp": "chrome", "fm": "junk", "cs": "junk"}):
     check(node.get("fp") == "unsafe", "rule 12: existing fp is overwritten")
-    check(node.get("fm") == transform.FM_443, "rule 12: existing fm is overwritten")
+    check(node.get("fm") == transform.FM, "rule 12: existing fm is overwritten")
+
+# DIAL_MODE is "" today, so nothing should be emitted for it. Both states are
+# patched in, because a test against the live constant asserts nothing about
+# the set case while it is empty -- and the fork will grow more values.
+real_dial = transform.DIAL_MODE
+try:
+    transform.DIAL_MODE = ""
+    for node in finalised(**BASE):
+        check(not node.has("dialMode"), "rule 12: an empty dialMode publishes nothing")
+        check("dialMode" not in node.to_link(),
+              "rule 12: an empty dialMode is absent from the published link")
+        check("sockopt" not in node.to_outbound("t")["streamSettings"],
+              "rule 12: an empty dialMode renders no sockopt")
+    transform.DIAL_MODE = "code-1"
+    for node in finalised(**BASE):
+        check(node.get("dialMode") == "code-1", "rule 12: a set dialMode reaches the node")
+        check("dialMode=code-1" in node.to_link(),
+              "rule 12: a set dialMode reaches the published link")
+        check(node.to_outbound("t")["streamSettings"]["sockopt"] == {"dialMode": "code-1"},
+              "rule 12: a set dialMode reaches streamSettings.sockopt")
+finally:
+    transform.DIAL_MODE = real_dial
+
+# --- naming ----------------------------------------------------------------
+# A published name carries a short content hash so a client can tell two nodes
+# apart. It is taken from what the node IS upstream, not from what the pipeline
+# injects, so repointing an endpoint or retuning a mask must not rename
+# everything -- that would turn a run that found nothing new into a full-file
+# diff and a pointless daily commit.
+
+
+def _name_under(**overrides) -> str:
+    """The published name of the BASE node with some tunables patched."""
+    keys = list(overrides)
+    saved = [getattr(transform, key) for key in keys]
+    try:
+        for key, value in overrides.items():
+            setattr(transform, key, value)
+        return one(**BASE)[0].tag
+    finally:
+        for key, value in zip(keys, saved):
+            setattr(transform, key, value)
+
+
+baseline_name = _name_under()
+check(baseline_name.startswith("name | "),
+      "naming: the source comment leads the published name")
+for label, overrides in (
+    ("the output address", dict(OUTPUT_ADDRESS="10.9.8.7")),
+    ("the health-check address", dict(HEALTHCHECK_ADDRESS="10.9.8.7")),
+    ("the output port", dict(OUTPUT_PORT="8443")),
+    ("the cipher list", dict(CS="TLS_AES_128_GCM_SHA256")),
+    ("the fingerprint", dict(FP="chrome")),
+    ("fm and dialMode", dict(FM="{}", DIAL_MODE="code-1")),
+):
+    check(_name_under(**overrides) == baseline_name,
+          f"naming: changing {label} does not rename nodes")
+
+check(one(**{**BASE, "host": "b.example"})[0].tag != baseline_name,
+      "naming: a genuinely different node still gets a different name")
+check(transform.naming_identity(one(**BASE)[0])
+      == transform.naming_identity(one(**{**BASE, "fm": "x", "dialMode": "y"})[0]),
+      "naming: what a source supplied for fm or dialMode cannot affect a name")
 
 # --- parser edge cases -----------------------------------------------------
 
@@ -314,12 +481,15 @@ try:
     transform.INCLUDE_VMESS = True
     vm_out = transform.transform([parse_line(VMESS_FULL)], {})
     check(len(vm_out) == 1, "vmess: with the toggle on it survives as a single node")
-    vm443 = vm_out[0]
-    check(vm443.address == transform.EXIT_ADDRESS and vm443.security == "tls",
+    check(vm_out[0].address == transform.HEALTHCHECK_ADDRESS,
+          "vmess: rule 10 points a vmess node at the health-check address too")
+    vm443 = transform.finalise(vm_out, {})[0]
+    check(vm443.address == transform.OUTPUT_ADDRESS and vm443.security == "tls",
           "vmess: rules 8 and 10 apply to a vmess node")
-    check(vm443.port == "443", "vmess: a vmess node ends up on 443 like any other")
-    check(vm443.get("fm") == transform.FM_443 and vm443.get("cs") == transform.CS_443,
-          "vmess: rule 12 sets fm and cs on the node")
+    check(vm443.port == transform.OUTPUT_PORT,
+          "vmess: a vmess node ends up on the output port like any other")
+    check(vm443.get("fm") == transform.FM and vm443.get("cs") == transform.CS,
+          "vmess: the pipeline sets fm and cs on the node")
 
     # The documented limitation, verified rather than assumed: the vmess wire
     # format has a fixed key set with nowhere to put fm or cs, so they are
@@ -329,11 +499,12 @@ try:
     ).decode("utf-8", "replace"))
     check("fm" not in payload and "cs" not in payload,
           "vmess: the wire format has nowhere to carry fm or cs")
-    check(transform.FM_443_ENCODED not in vm443.to_link(),
+    check(transform.FM_ENCODED not in vm443.to_link(),
           "vmess: fm really is absent from the emitted link")
     check(payload["tls"] == "tls" and payload["sni"] == "vm.example",
           "vmess: what the format can carry is still carried")
-    check(payload["add"] == transform.EXIT_ADDRESS and payload["port"] == "443",
+    check(payload["add"] == transform.OUTPUT_ADDRESS
+          and payload["port"] == transform.OUTPUT_PORT,
           "vmess: the rewritten address and port reach the wire format")
 finally:
     transform.INCLUDE_VMESS = real_include
@@ -341,30 +512,71 @@ finally:
 # --- masking constants round trip ------------------------------------------
 
 for name, encoded, decoded in (
-    ("FM_443", transform.FM_443_ENCODED, transform.FM_443),
-    ("CS_443", transform.CS_443_ENCODED, transform.CS_443),
+    ("FM", transform.FM_ENCODED, transform.FM),
+    ("CS", transform.CS_ENCODED, transform.CS),
+    ("FP", transform.FP_ENCODED, transform.FP),
+    ("DIAL_MODE", transform.DIAL_MODE_ENCODED, transform.DIAL_MODE),
 ):
     check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
+
+# The round trip above only proves the constants are self-consistent -- it
+# compares each one against itself, so a wrong value round-trips just as
+# happily as a right one. These pin what the values actually have to be.
+check(json.loads(transform.FM) == {
+    "tcp": [
+        {"type": "fragment", "settings": {
+            "packets": "tlshello", "lengths": ["5", "94", "1"],
+            "delays": ["0"], "maxSplit": "0"}},
+        {"type": "fragment", "settings": {
+            "packets": "1-1", "lengths": ["109", "1"],
+            "delays": ["1"], "maxSplit": "355"}},
+    ]
+}, "constants: fm is the exact fragment specification asked for")
+check(transform.FP == "unsafe", "constants: fp is unsafe")
+check(transform.CS.split(":") == [
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+], "constants: cs is the exact cipher list asked for, in order")
 
 # --- Xray outbound rendering ----------------------------------------------
 
 
-for node in one(**BASE):
+for node in finalised(**BASE):
     outbound = json.loads(json.dumps(node.to_outbound("t")))
     stream = outbound["streamSettings"]
     check(outbound["protocol"] == "vless", "outbound: protocol")
     check(stream["network"] == "ws", "outbound: network")
     check(isinstance(stream.get("finalmask"), dict), "outbound: fm becomes a finalmask object")
     check(stream["wsSettings"]["host"] == "a.example", "outbound: ws host header")
-    if node.port == "443":
-        check(stream["security"] == "tls", "outbound: 443 uses tls")
-        check(stream["tlsSettings"]["fingerprint"] == "unsafe", "outbound: fingerprint")
-        check(stream["tlsSettings"]["cipherSuites"] == transform.CS_443, "outbound: cipherSuites")
-        check(stream["tlsSettings"]["allowInsecure"] is False, "outbound: never skips verification")
-    else:
-        check(stream["security"] == "none", "outbound: 8080 is plaintext")
+    check(stream["security"] == "tls", "outbound: every published node uses tls")
+    check(stream["tlsSettings"]["fingerprint"] == "unsafe", "outbound: fingerprint")
+    check(stream["tlsSettings"]["cipherSuites"] == transform.CS, "outbound: cipherSuites")
+    check(stream["tlsSettings"]["allowInsecure"] is False, "outbound: never skips verification")
+
+# A node in the state the health check sees it: fp and cs, but nothing that
+# would make the measurement about the masking rather than the node.
+for node in one(**BASE):
+    stream = node.to_outbound("t")["streamSettings"]
+    check("finalmask" not in stream, "outbound: a node being tested renders no finalmask")
+    check("sockopt" not in stream, "outbound: a node being tested renders no sockopt")
+    check(stream["tlsSettings"]["cipherSuites"] == transform.CS,
+          "outbound: a node being tested still renders its cipherSuites")
+    check(stream["tlsSettings"]["fingerprint"] == "unsafe",
+          "outbound: a node being tested still renders its fingerprint")
 
 grpc = one(**{**BASE, "type": "grpc", "serviceName": "gs"})
+check(len(grpc) == 1, "outbound: a grpc node reaches the outbound tests at all")
 for node in grpc:
     outbound = node.to_outbound("t")
     check(outbound["streamSettings"]["network"] == "grpc", "outbound: grpc network")
@@ -647,26 +859,65 @@ finally:
     # Leaving this stubbed would silently feed the endpoint tests below.
     healthcheck.usable_endpoints = real_usable_endpoints
 
-# The preflight has to exercise both shapes the pipeline emits, or it proves
-# nothing about the core it is about to trust.
+# The preflight has to exercise both shapes the pipeline emits -- the one the
+# health check runs and the one the subscription publishes -- or it proves
+# nothing about the core it is about to trust. The published shape matters most
+# here: fm is added after the check, so the preflight is the only place in the
+# pipeline that ever hands one to the core.
 probes = healthcheck.preflight_probes()
-check({node.port for _, node in probes} == {"443"},
-      "healthcheck: preflight checks the one shape the pipeline emits")
-tls_probe = probes[0][1]
+check(len(probes) == 2, "healthcheck: the preflight checks both shapes")
+tested_probe, published_probe = probes[0][1], probes[1][1]
+
 check(
-    tls_probe.get("fp") == "unsafe"
-    and tls_probe.get("fm") == transform.FM_443
-    and tls_probe.get("cs") == transform.CS_443,
-    "healthcheck: the probe carries the real fp, fm and cs values",
+    tested_probe.get("fp") == transform.FP and tested_probe.get("cs") == transform.CS,
+    "healthcheck: the tested probe carries the real fp and cs values",
 )
-check(tls_probe.security == "tls", "healthcheck: the probe is a TLS outbound")
-check(
-    all(node.address == transform.EXIT_ADDRESS for _, node in probes),
-    "healthcheck: probes use the real exit address, not a placeholder",
+check(not tested_probe.has("fm") and not tested_probe.has("dialMode"),
+      "healthcheck: the tested probe carries no fm or dialMode, like the pool it stands for")
+check((tested_probe.address, tested_probe.port)
+      == (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT),
+      "healthcheck: the tested probe uses the real health-check endpoint")
+
+check(published_probe.get("fm") == transform.FM,
+      "healthcheck: the published probe carries the real fm value")
+check(published_probe.get("fp") == transform.FP
+      and published_probe.get("cs") == transform.CS,
+      "healthcheck: the published probe keeps fp and cs as well")
+check((published_probe.address, published_probe.port)
+      == (transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT),
+      "healthcheck: the published probe uses the real output endpoint")
+
+check(tested_probe.security == "tls" and published_probe.security == "tls",
+      "healthcheck: both probes are TLS outbounds")
+
+rendered = json.dumps(
+    healthcheck._build_config([published_probe], healthcheck._placeholder_ports(1))
 )
-for _, node in probes:
-    rendered = json.dumps(healthcheck._build_config([node], healthcheck._placeholder_ports(1)))
-    check("finalmask" in rendered, f"healthcheck: the port {node.port} probe renders a finalmask")
+check("finalmask" in rendered, "healthcheck: the published probe renders a finalmask")
+rendered = json.dumps(
+    healthcheck._build_config([tested_probe], healthcheck._placeholder_ports(1))
+)
+check("finalmask" not in rendered, "healthcheck: the tested probe renders no finalmask")
+
+# A dialMode has to be validated too once one is set, and only on the shape
+# that carries it.
+real_dial = transform.DIAL_MODE
+try:
+    transform.DIAL_MODE = "code-1"
+    dial_probes = healthcheck.preflight_probes()
+    check("dialMode" in dial_probes[1][0],
+          "healthcheck: a set dialMode is named in the published probe's description")
+    check(dial_probes[1][1].get("dialMode") == "code-1",
+          "healthcheck: a set dialMode reaches the published probe")
+    check(not dial_probes[0][1].has("dialMode"),
+          "healthcheck: a set dialMode never reaches the tested probe")
+    rendered = json.dumps(
+        healthcheck._build_config([dial_probes[1][1]], healthcheck._placeholder_ports(1))
+    )
+    check('"dialMode": "code-1"' in rendered,
+          "healthcheck: the published probe renders the dialMode sockopt")
+finally:
+    transform.DIAL_MODE = real_dial
 
 
 # Endpoint selection and the pass/fail decision inside _probe. Both are stubbed
@@ -983,6 +1234,24 @@ completed, _, produced = run_build(
 check(completed.returncode == 0, "sources: a dead source does not fail the build")
 check("live.example" in produced, "sources: the surviving source still publishes")
 check("unreachable source" in completed.stdout, "sources: the dead source is reported")
+
+# finalise has to be wired into build.py, not merely implemented: the deferred
+# parameters and the output endpoint reach configs.txt only if the build runs
+# it after the health check.
+completed, _, produced = run_build(serve(GOOD_BODY))
+emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
+check(completed.returncode == 0 and len(emitted) == 1,
+      "finalise: the build publishes the one node it was given")
+published = parse_line(emitted[0])
+check(published.get("fm") == transform.FM,
+      "finalise: build.py adds fm to what it publishes")
+check(transform.FM_ENCODED in emitted[0],
+      "finalise: the published fm is byte-exact in configs.txt")
+check(published.get("fp") == transform.FP and published.get("cs") == transform.CS,
+      "finalise: build.py keeps the masking the health check ran with")
+check((published.address, published.port)
+      == (transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT),
+      "finalise: build.py publishes on the output endpoint")
 
 # A URL with no scheme is the likeliest typo in a hand-edited sources.txt.
 # urllib raises ValueError for it, which is not a URLError, so left unhandled

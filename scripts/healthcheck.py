@@ -3,8 +3,14 @@
 Reimplements the criterion the upstream project publishes in its own header --
 "a real proxied request to https://cp.cloudflare.com/generate_204 succeeded in
 ALL 3 independent runs" -- directly against Xray-core rather than a wrapper, so
-the ``fm`` / ``cs`` / ``fp=unsafe`` parameters in the emitted links are the ones
-being exercised.
+the ``fp=unsafe`` and ``cs`` parameters in the emitted links are the ones being
+exercised.
+
+The nodes reaching this stage deliberately carry no ``fm`` or ``dialMode``:
+those change how a connection is made rather than whether the node works, and
+transform.finalise adds them to the survivors afterwards. :func:`preflight`
+therefore validates the published shape as well as the tested one, because
+nothing else in the pipeline ever feeds an ``fm`` to the core.
 
 Shape of a round: nodes are grouped into batches; each batch becomes one Xray
 process with one loopback HTTP inbound per node, routed to that node's outbound.
@@ -269,33 +275,54 @@ def preflight(xray: str) -> list[str]:
 
 
 def preflight_probes() -> list[tuple[str, Node]]:
-    """The configuration the pipeline emits: a TLS node on port 443 carrying
-    the full masking set.
+    """The two shapes this pipeline produces: what the health check runs, and
+    what the subscription publishes.
 
-    There used to be a second probe for plaintext port 8080 nodes. Rule 9
-    converts those to TLS now, so that shape is never published. The address
-    comes from transform's rule 10 constant rather than being written out
-    again, so repointing the exit repoints what the preflight tests.
+    They differ, so both are worth proving. The tested shape carries ``fp`` and
+    ``cs``; the published shape adds ``fm`` and ``dialMode`` on top and points
+    at the output endpoint. Without the second probe an unusable ``fm`` would
+    reach configs.txt unchallenged -- the health check never sees one.
+
+    Both take their address, port and parameter values from transform's own
+    constants rather than writing them out again, so repointing an endpoint or
+    retuning a mask repoints and retunes what the preflight tests.
     """
+
+    def probe(address: str, port: str, **extra: str) -> Node:
+        params = {
+            "encryption": "none",
+            "security": "tls",
+            "type": "ws",
+            "host": "example.com",
+            "path": "/",
+            "sni": "example.com",
+            "fp": transform.FP,
+            "cs": transform.CS,
+        }
+        params.update({k: v for k, v in extra.items() if v})
+        return Node(
+            scheme="vless",
+            uid="00000000-0000-0000-0000-000000000000",
+            address=address,
+            port=str(port),
+            params=params,
+        )
+
+    published = "fm fragment"
+    if transform.DIAL_MODE:
+        published += " + dialMode sockopt"
     return [
         (
-            "port 443 masking (fp=unsafe + fm fragment + cs cipherSuites)",
-            Node(
-                scheme="vless",
-                uid="00000000-0000-0000-0000-000000000000",
-                address=transform.EXIT_ADDRESS,
-                port="443",
-                params={
-                    "encryption": "none",
-                    "security": "tls",
-                    "type": "ws",
-                    "host": "example.com",
-                    "path": "/",
-                    "sni": "example.com",
-                    "fp": transform.FP_443,
-                    "fm": transform.FM_443,
-                    "cs": transform.CS_443,
-                },
+            "tested shape (fp=unsafe + cs cipherSuites)",
+            probe(transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT),
+        ),
+        (
+            f"published shape (adds {published})",
+            probe(
+                transform.OUTPUT_ADDRESS,
+                transform.OUTPUT_PORT,
+                fm=transform.FM,
+                dialMode=transform.DIAL_MODE,
             ),
         ),
     ]
