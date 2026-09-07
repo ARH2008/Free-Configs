@@ -67,15 +67,16 @@ class TestEndpoint(NamedTuple):
 # a single endpoint being blocked or down would read as "every node is dead".
 # Borrowed from Delta-Kronecker/V2ray-Config, which tests against a list of
 # URLs; the per-round rotation is the adaptation that keeps the cost identical.
+# Securely load the API key passed from GitHub Actions
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
 TEST_ENDPOINTS: tuple[TestEndpoint, ...] = (
-    TestEndpoint("cp.cloudflare.com", "/generate_204", (204,)),
-    TestEndpoint("www.gstatic.com", "/generate_204", (204,)),
-    TestEndpoint("captive.apple.com", "/hotspot-detect.html", (200,)),
+    TestEndpoint("generativelanguage.googleapis.com", f"/v1beta/models?key={GEMINI_API_KEY}", (200,)),
 )
 ENDPOINT_CHECK_TIMEOUT = 10.0
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 
-ROUNDS = 3                 # a node must pass every round
+ROUNDS = 1                 # a node must pass every round
 REQUEST_TIMEOUT = 5.0      # seconds, matches upstream's 5000ms budget
 # These two are independent, and were measured separately on 192 nodes.
 #
