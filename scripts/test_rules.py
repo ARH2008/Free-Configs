@@ -390,6 +390,41 @@ check(transform.naming_identity(one(**BASE)[0])
       == transform.naming_identity(one(**{**BASE, "fm": "x", "dialMode": "y"})[0]),
       "naming: what a source supplied for fm or dialMode cannot affect a name")
 
+# This project's own configs.txt is the first entry in sources.txt, so a node
+# routinely arrives with a name this file already built. Re-appending the hash
+# would grow the name by six characters every day, and since the name is part
+# of the link, configs.txt would be rewritten and committed daily for nothing.
+for raw, expected in (
+    ("NAME | d152c7", "NAME"),
+    ("NAME | d152c7 | d152c7 | aaa111", "NAME"),      # cleans up accumulated ones
+    ("NAME | notahex", "NAME | notahex"),             # not a digest, left alone
+    ("NAME | ABC123", "NAME | ABC123"),               # digests are lowercase
+    ("NAME | abc12", "NAME | abc12"),                 # five characters, not six
+    # Only a suffix is a suffix: a hash-shaped run in the middle of someone's
+    # comment is part of their comment.
+    ("a | abc123 | tail", "a | abc123 | tail"),
+    ("abc123 tail", "abc123 tail"),
+    ("a | b | c", "a | b | c"),
+    ("", ""),
+):
+    got = transform.source_comment(Node("vless", "u", "a", "443", {}, raw))
+    check(got == expected, f"naming: source_comment({raw!r}) -> {expected!r}")
+
+# The property that matters: a published link fed back through the pipeline
+# emits itself, byte for byte, however many times it goes round.
+published_link = transform.finalise(one(**BASE), {})[0].to_link()
+current = published_link
+for cycle in range(1, 6):
+    node = parse_line(current)
+    current = transform.finalise(transform.transform([node], {}), {})[0].to_link()
+    check(current == published_link,
+          f"naming: cycle {cycle} of re-ingestion emits the identical link")
+final_tag = parse_line(current).tag
+check(final_tag.count("|") == 1,
+      "naming: exactly one hash remains on the name after five cycles")
+check(final_tag == baseline_name,
+      "naming: five cycles of re-ingestion leave the name the first build gave it")
+
 # --- parser edge cases -----------------------------------------------------
 
 node = parse_line("vless://uid@[2001:db8::1]:443?type=ws&host=a.example&security=tls#n")

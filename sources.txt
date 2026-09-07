@@ -15,6 +15,13 @@
 # If one source is unreachable the build continues with the rest and says so.
 # It only fails if every source is unreachable.
 
+# This project's own last published list, first on purpose. It is what lets a
+# node that every upstream source has dropped stay in the subscription for as
+# long as it keeps passing the health check -- nothing here is trusted, it is
+# re-tested from scratch like any other node, so a node that dies drops out on
+# its own. Being first also means that if the pool ever outgrows
+# MAX_NODES_TO_TEST, the nodes already known to work are the ones kept.
+https://raw.githubusercontent.com/patterniha/Free-Configs/main/configs.txt
 https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/verified/configs.txt
 https://raw.githubusercontent.com/itsyebekhe/PSG/main/subscriptions/xray/mix
 https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/main/config/all_configs.txt

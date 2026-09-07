@@ -40,6 +40,7 @@ NORMALISATION where it happens:
 from __future__ import annotations
 
 import hashlib
+import re
 from urllib.parse import quote, unquote
 
 from nodes import ECH_KEYS, INSECURE_KEYS, Node
@@ -333,15 +334,35 @@ def naming_identity(node: Node) -> tuple:
     )
 
 
+# Every published name ends in " | <6 hex>". This project's own configs.txt is
+# one of its sources -- that is what lets a node upstream has dropped stay in
+# the list as long as it keeps passing -- so a node routinely arrives with that
+# suffix already on it. Appending another would grow the name by six characters
+# a day, and because the name is part of the link, configs.txt would be
+# rewritten and committed daily even when nothing had changed.
+_OWN_HASH_SUFFIX = re.compile(r"(?: \| [0-9a-f]{6})+$")
+
+
+def source_comment(node: Node) -> str:
+    """The node's display name with any hash :func:`make_tag` appended removed.
+
+    Matches the lowercase 6-hex digest this file emits, so a source comment
+    that merely contains a pipe is left alone. Strips a whole run of them, to
+    clean up any name that grew before this existed.
+    """
+    return _OWN_HASH_SUFFIX.sub("", node.tag.strip()).strip()
+
+
 def make_tag(node: Node) -> str:
     """The published name: the source's own comment, then a short content hash.
 
     The hash comes from :func:`naming_identity`, so the same upstream node
     always gets the same name and an unchanged upstream produces an unchanged
-    configs.txt -- including across a change of exit address or masking.
+    configs.txt -- including across a change of exit address or masking, and
+    across this project re-reading its own output.
     """
     digest = hashlib.sha256(repr(naming_identity(node)).encode("utf-8")).hexdigest()[:6]
-    comment = node.tag.strip()
+    comment = source_comment(node)
     if KEEP_SOURCE_COMMENT and comment:
         head = comment
     else:
