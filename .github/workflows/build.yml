@@ -39,10 +39,17 @@ jobs:
 
       - name: Install newest Xray-core
         env:
-          # patterniha/Xray-core, not XTLS/Xray-core. The fork drops the
-          # validateOutboundTransportSecurity check that forbids VLESS/Trojan
-          # without TLS to a public address, which is exactly what every port
-          # 8080 node in this list is.
+          # patterniha/Xray-core, not XTLS/Xray-core: dialMode
+          # (streamSettings.sockopt.dialMode) exists only in the fork, and the
+          # fork is what these configs are meant to run on.
+          #
+          # It was once needed for a harder reason -- upstream's
+          # validateOutboundTransportSecurity rejects a VLESS or Trojan
+          # outbound without transport security to a public address, which
+          # every port 8080 node in this list was. Rule 9 converts those to TLS
+          # now, and that check returns early for any outbound carrying a
+          # security type, so it no longer applies. fm (finalmask), cs
+          # (cipherSuites) and fp=unsafe are all upstream features too.
           #
           # The newest release is resolved at run time, so publishing a release
           # in the fork is all it takes for the next build to pick it up. The
