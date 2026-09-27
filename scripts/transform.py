@@ -7,47 +7,52 @@ shape of this whole file:
 * :func:`transform` runs *before* the health check. It filters (rules 1-8),
   converts plaintext nodes to TLS (rule 9), points every node at the
   health-check endpoint (rule 10), strips what must not be tested (rule 11 and
-  :func:`strip_deferred_params`) and applies the masking the check is meant to
-  exercise (rule 12: ``fp`` and ``cs``).
+  :func:`strip_deferred_params`) and sets the SNI Cloudflare routes on.
 
-* :func:`finalise` runs on the survivors. It adds the parameters that were
-  deliberately withheld -- ``fm`` and ``dialMode`` -- and repoints each node at
-  the published endpoint, which need not be the one it was tested through.
-  Those two are configured as a list of pairs, and a survivor is published once
-  per pair, so N survivors and I pairs make N * I configs in one file.
+* :func:`finalise` runs on the survivors. It adds the six parameters that were
+  deliberately withheld -- ``fm``, ``dialMode``, ``ech``, ``echOutbound``,
+  ``fp`` and ``cs`` -- and repoints each node at the published endpoint, which
+  need not be the one it was tested through. They are configured as a list of
+  variants, and a survivor is published once per variant, so N survivors and
+  I variants make N * I configs in one file.
 
-The split exists because ``fm`` (finalmask) and ``dialMode`` change *how* the
-connection is made, not *whether* the node carries traffic. Testing without
-them measures the node itself, and adding them afterwards is a client-side
+The split exists because those six shape *how* the connection is made, not
+*whether* the node carries traffic. Testing without them measures the node
+itself, over the core's plain TLS, and adding them afterwards is a client-side
 choice that can be retuned without re-testing anything. A node arriving from a
-source carrying its own ``fm`` or ``dialMode`` therefore has them removed
-before the check, whatever they said, so no source can smuggle its own
-fragmentation into the run.
+source carrying its own value for any of them has it removed before the check,
+whatever it said, so no source can smuggle its own fragmentation, dialer, ECH
+or fingerprint into the run.
 
 Everything published is TLS on port 443. Nodes arriving on a plaintext
 Cloudflare port are converted rather than kept alongside a TLS twin: the ISP
 this list is built for blocks unencrypted connections to Cloudflare, so a
 port 8080 node is untestable and unusable.
 
-Two normalisations are applied on top of the numbered rules, each marked
+Three normalisations are applied on top of the numbered rules, each marked
 NORMALISATION where it happens:
 
 * rule 9 sets ``sni`` to ``host`` when converting, because the node is being
   moved onto TLS and Cloudflare selects the origin by SNI;
-* every node gets ``sni`` set to its ``host``, because rule 10 replaces the
-  address with a Cloudflare IP -- an ``sni`` still naming the origin server
-  would never connect.
+* every node gets ``sni`` set to its ``host`` (:func:`normalise_sni`), because
+  rule 10 replaces the address with a Cloudflare IP -- an ``sni`` still naming
+  the origin server would never connect;
+* every ws and httpupgrade node gets ``alpn=http/1.1``
+  (:func:`normalise_upgrade_alpn`), because both open with an HTTP/1.1 Upgrade
+  that cannot run over h2.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import re
 from typing import NamedTuple
 from urllib.parse import quote, unquote
 
-from nodes import ECH_KEYS, INSECURE_KEYS, Node
+from nodes import INSECURE_KEYS, WS_ALIASES, Node
 
 # --- rule 10: where nodes point -------------------------------------------
 # Two independent pairs. The endpoint a node is *tested* through does not have
@@ -69,76 +74,251 @@ PORTS_MAPPED_TO_8080 = ("80", "8080", "8880", "2052", "2082", "2086", "2095")
 ALLOWED_SECURITY = ("", "tls", "none")
 ALLOWED_TRANSPORTS = ("ws", "xhttp", "websocket", "httpupgrade", "grpc")
 
-# --- rule 12: masking applied BEFORE the health check ---------------------
-# These two describe the TLS handshake itself, so the check has to run with
-# them: a node that cannot complete a handshake with this fingerprint and this
-# cipher list is not a node this subscription can publish. Stored exactly as
-# supplied (percent-encoded) and decoded once at import. The self-check below
-# proves re-encoding reproduces these strings byte for byte, so what lands in
-# configs.txt is what was asked for.
-FP_ENCODED = "unsafe"
-CS_ENCODED = (
-    "TLS_AES_256_GCM_SHA384%3ATLS_CHACHA20_POLY1305_SHA256%3ATLS_AES_128_GCM_SHA256%3A"
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384%3A"
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256%3A"
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
-    "%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3A"
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256"
-)
-
 # --- parameters applied AFTER the health check ----------------------------
-# fm (finalmask) splits the outgoing packets; dialMode selects which dialing
-# code the core runs (streamSettings.sockopt.dialMode, added to the fork in
-# a3261029). Neither decides whether a node carries traffic, so both are
-# withheld from the check and put on the survivors.
+# Six share-link parameters that shape *how* a connection is made rather than
+# *whether* a node carries traffic, so the health check runs without any of
+# them -- over the core's plain TLS -- and they are put on the survivors:
 #
-# They travel together as one list of (fm, dialMode) pairs, so a variant is a
-# pair by construction and the two can never drift out of step. Every healthy
-# node is published once per variant, its variants adjacent, so N healthy nodes
-# and I variants become N * I lines -- still one configs.txt and one
-# configs_base64.txt. With a single variant, which is the default, that is one
-# line per node exactly as before.
+#   fm           finalmask -- splits the outgoing packets
+#   dialMode     streamSettings.sockopt.dialMode, which dialing code the core
+#                runs (fork-only, added in a3261029)
+#   ech          tlsSettings.echConfigList -- a base64 ECHConfigList, or a DNS
+#                query that fetches one, as "name+https://1.1.1.1/dns-query"
+#                (h2c:// and udp:// work too; without "name+" the node's own
+#                SNI is looked up)
+#   echOutbound  a whole Xray outbound, as JSON, that PattN and PattNG add to
+#                the config and send the ECH config query through
+#                (tlsSettings.echSockopt.dialerProxy). It needs an ech beside
+#                it, and a tag that is not empty, "direct" or "block" and does
+#                not start with "proxy" -- both clients refuse anything else.
+#   fp           tlsSettings.fingerprint -- the uTLS ClientHello to imitate
+#   cs           tlsSettings.cipherSuites -- colon-separated Go suite names
+#
+# They travel together as one list of variants, so the six can never drift
+# out of step. Every healthy node is published once per variant, its variants
+# adjacent, so N healthy nodes and I variants become N * I lines -- still one
+# configs.txt and one configs_base64.txt. With a single variant, which is the
+# default, that is one line per node exactly as before.
 #
 # An entry of "" publishes that parameter's default: nothing is written for it.
 # For dialMode that costs nothing, because an absent dialMode and dialMode=""
 # are the same thing to the core -- both run the default dialer.
 #
 # Note what the split costs: a value here is never exercised by the health
-# check. An unusable fm is at least caught by the preflight, which validates
-# the published shape against the core before any testing starts. dialMode is
-# not, because the core accepts any string at parse time and only rejects one
-# it has no code for when it actually dials -- so a dialMode the deployed core
-# does not implement would ship as a list that fails at connect time. Keep it
-# matched to what that build supports.
+# check -- including, for fp and cs, the TLS handshake itself: a node that
+# passes over plain TLS is not proven to complete one with this fingerprint and
+# these ciphers. _self_check below and the preflight catch what they can before
+# any testing starts -- fm, echOutbound and fp are validated by the core
+# itself, and ech and cs are checked against what the core accepts, because it
+# silently tolerates both. dialMode is not: the
+# core takes any string at parse time and only rejects one it has no code for
+# when it dials, so a dialMode the deployed core does not implement would ship
+# as a list that fails at connect time. Keep it matched to what that build
+# supports.
+
+
 class Variant(NamedTuple):
     """One published flavour of every healthy node."""
 
     fm: str
     dial_mode: str
+    ech: str
+    ech_outbound: str
+    fp: str
+    cs: str
 
 
-# Add a variant by adding a pair. Each is (fm, dialMode), percent-encoded
-# exactly as it will be emitted; "" for either publishes that one's default.
+# Add a variant by adding an entry. Each is (fm, dialMode, ech, echOutbound,
+# fp, cs), percent-encoded exactly as it will be emitted; "" for any of them
+# publishes that one's default. Write echOutbound as compact JSON on one line.
 VARIANTS_ENCODED = [
     (
+        # fm
         "%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22"
         "packets%22%3A%20%22tlshello%22%2C%20%22lengths%22%3A%20%5B%220%22%2C%20%22104%22%2C%20%22"
         "1%22%5D%2C%20%22delays%22%3A%20%5B%220%22%5D%2C%20%22maxSplit%22%3A%20%220%22%7D%7D%2C%7B"
         "%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22packets%22%3A%20%221-1%22%2C"
         "%20%22lengths%22%3A%20%5B%22114%22%2C%20%221%22%5D%2C%20%22delays%22%3A%20%5B%221%22%5D%2C"
         "%20%22maxSplit%22%3A%20%2211%22%7D%7D%5D%7D",
+        # dialMode
         "",
+        # ech
+        "",
+        # echOutbound
+        "",
+        # fp
+        "unsafe",
+        # cs
+        "TLS_AES_256_GCM_SHA384%3ATLS_CHACHA20_POLY1305_SHA256%3ATLS_AES_128_GCM_SHA256%3A"
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384%3ATLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384%3A"
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256%3A"
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256%3ATLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+        "%3ATLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA%3ATLS_ECDHE_RSA_WITH_AES_256_CBC_SHA%3A"
+        "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256%3ATLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
     ),
 ]
 
-FP = unquote(FP_ENCODED)
-CS = unquote(CS_ENCODED)
-VARIANTS = [Variant(unquote(fm), unquote(dial_mode)) for fm, dial_mode in VARIANTS_ENCODED]
+# The share-link keys of each Variant field, in field order: the spelling
+# :func:`apply_deferred_params` writes and both clients read. PattNG looks
+# echOutbound up with an exact-case map key, so the casing here is load-bearing.
+VARIANT_KEYS = ("fm", "dialMode", "ech", "echOutbound", "fp", "cs")
 
-# The two parameters :func:`finalise` owns, in every spelling. They are removed
+# The six parameters :func:`finalise` owns, in every spelling. They are removed
 # on the way in and set on the way out, so whatever a source supplied has no
 # influence on either the health check or the published value.
-DEFERRED_KEYS = ("fm", "dialmode")
+DEFERRED_KEYS = tuple(key.lower() for key in VARIANT_KEYS)
+
+# The DNS servers the core can fetch an ECH config from (transport/internet/tls
+# /ech.go). Anything else never yields a config, and every connection fails.
+ECH_DNS_SCHEMES = ("https://", "h2c://", "udp://")
+
+# Tags both clients refuse for an ECH outbound: direct and block are the
+# config's own outbounds, and balancers pick their members by the "proxy"
+# prefix, so an ECH outbound under it would end up carrying proxied traffic.
+ECH_OUTBOUND_RESERVED_TAGS = ("direct", "block")
+ECH_OUTBOUND_RESERVED_PREFIX = "proxy"
+
+# Every name Go's crypto/tls knows, from tls.CipherSuites() and
+# tls.InsecureCipherSuites() -- the two lists the core builds cipherSuites
+# from (transport/internet/tls/config.go). It drops any name not in them
+# without a word, so a typo silently loses a suite, and a cs that is all typos
+# silently becomes Go's defaults. Nothing downstream would ever notice.
+GO_CIPHER_SUITES = frozenset({
+    # tls.CipherSuites()
+    "TLS_AES_128_GCM_SHA256",
+    "TLS_AES_256_GCM_SHA384",
+    "TLS_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    # tls.InsecureCipherSuites()
+    "TLS_RSA_WITH_RC4_128_SHA",
+    "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_CBC_SHA",
+    "TLS_RSA_WITH_AES_256_CBC_SHA",
+    "TLS_RSA_WITH_AES_128_CBC_SHA256",
+    "TLS_RSA_WITH_AES_128_GCM_SHA256",
+    "TLS_RSA_WITH_AES_256_GCM_SHA384",
+    "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+    "TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+    "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+})
+
+
+def cs_problem(value: str) -> str | None:
+    """Why the core would not use ``value`` as the cipher list given, or None."""
+    names = [name.strip() for name in value.split(":")]
+    unknown = [name for name in names if name not in GO_CIPHER_SUITES]
+    if unknown:
+        return (
+            "names cipher suites the core does not know, which it would silently"
+            f" drop: {', '.join(repr(name) for name in unknown)}"
+        )
+    if len(set(names)) != len(names):
+        return "names a cipher suite twice"
+    return None
+
+
+def ech_problem(value: str) -> str | None:
+    """Why the core would fail to use ``value`` as an echConfigList, or None.
+
+    Mirrors ApplyECH in transform/internet/tls/ech.go, which only runs when a
+    connection is dialled -- xray run -test stores the string without looking
+    at it, so this is the only check it gets before the list is published.
+    """
+    if "://" in value:
+        name, plus, server = value.partition("+")
+        if plus and not name:
+            return "a DNS query written as name+server needs the name before the '+'"
+        if not plus:
+            server = value
+        if not server.startswith(ECH_DNS_SCHEMES):
+            return (
+                "the core only fetches an ECH config from "
+                + ", ".join(ECH_DNS_SCHEMES)
+                + " DNS servers"
+            )
+        return None
+    try:
+        base64.b64decode(value, validate=True)
+    except (ValueError, binascii.Error):
+        return (
+            "neither a base64 ECHConfigList nor a DNS query such as"
+            " name+https://1.1.1.1/dns-query"
+        )
+    return None
+
+
+def _reject_duplicate_keys(pairs: list) -> dict:
+    """json object hook: PattN parses an echOutbound with duplicate keys
+    disallowed, so a repeated key would make it refuse every config."""
+    seen: set = set()
+    for key, _ in pairs:
+        if key in seen:
+            raise ValueError(f"repeated key {key!r}")
+        seen.add(key)
+    return dict(pairs)
+
+
+def ech_outbound_problem(value: str, ech: str) -> str | None:
+    """Why PattN or PattNG would refuse ``value`` as an echOutbound, or None.
+
+    The same checks both clients make on import (NodeValidator in PattN,
+    EchOutbound in PattNG). A value either of them refuses would make every
+    published config carrying it fail to load there.
+    """
+    try:
+        outbound = json.loads(value, object_pairs_hook=_reject_duplicate_keys)
+    except ValueError as error:
+        return f"not valid JSON: {error}"
+    if not isinstance(outbound, dict):
+        return "not a JSON object -- it has to be a whole Xray outbound"
+    if not ech:
+        return "needs an ech in the same variant; both clients refuse one without"
+    tag = outbound.get("tag")
+    if not isinstance(tag, str) or not tag:
+        return "has no tag, so echSockopt would have nothing to point at"
+    if tag in ECH_OUTBOUND_RESERVED_TAGS or tag.startswith(ECH_OUTBOUND_RESERVED_PREFIX):
+        return (
+            f"has the tag {tag!r}; it may not be direct or block,"
+            f" or start with {ECH_OUTBOUND_RESERVED_PREFIX!r}"
+        )
+    return None
+
+
+def _decode_variants(entries: object) -> list[Variant]:
+    """VARIANTS_ENCODED, decoded. An entry of the wrong shape is refused with a
+    message about it, rather than as a TypeError out of the NamedTuple."""
+    if not isinstance(entries, (list, tuple)):
+        raise AssertionError(
+            "VARIANTS_ENCODED must be a list of (fm, dialMode, ech, echOutbound, fp, cs)"
+            f" entries, not {type(entries).__name__}"
+        )
+    decoded: list[Variant] = []
+    for index, entry in enumerate(entries):
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != len(Variant._fields)
+            or not all(isinstance(value, str) for value in entry)
+        ):
+            raise AssertionError(
+                f"VARIANTS_ENCODED[{index}] is not an (fm, dialMode, ech, echOutbound, fp, cs)"
+                f" entry of six strings: {entry!r}"
+            )
+        decoded.append(Variant(*(unquote(value) for value in entry)))
+    return decoded
+
+
+VARIANTS = _decode_variants(VARIANTS_ENCODED)
 
 # A vmess share link is base64'd JSON with a fixed key set, and that key set has
 # nowhere to put fm or cs -- so a vmess node cannot satisfy rule 12 and would
@@ -159,41 +339,23 @@ NAME_PREFIX = ""
 def _self_check() -> None:
     """Fail loudly at import if a tunable above is unusable, rather than
     silently corrupting configs.txt."""
-    for name, encoded, decoded in (
-        ("CS", CS_ENCODED, CS),
-        ("FP", FP_ENCODED, FP),
-    ):
-        if quote(decoded, safe="") != encoded:
-            raise AssertionError(f"{name} does not round-trip through percent-encoding")
-
-    # A variant is a (fm, dialMode) pair, so the two can never be different
-    # lengths -- but the list itself, and the shape of each entry, are still
-    # worth checking here rather than as an IndexError deep inside finalise.
-    if not isinstance(VARIANTS_ENCODED, (list, tuple)):
-        raise AssertionError(
-            "VARIANTS_ENCODED must be a list of (fm, dialMode) pairs, not "
-            f"{type(VARIANTS_ENCODED).__name__}"
-        )
+    # A variant is one entry of six fields, so they can never drift out of
+    # step -- but the list itself, and the shape of each entry, are still worth
+    # checking here rather than as an IndexError deep inside finalise.
+    _decode_variants(VARIANTS_ENCODED)
     if not VARIANTS:
         raise AssertionError("VARIANTS is empty: there would be nothing to publish")
-    for index, entry in enumerate(VARIANTS_ENCODED):
-        if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            raise AssertionError(
-                f"VARIANTS_ENCODED[{index}] is not an (fm, dialMode) pair: {entry!r}"
-            )
 
     for index, (variant, encoded) in enumerate(zip(VARIANTS, VARIANTS_ENCODED)):
-        for field, value, raw in (
-            ("fm", variant.fm, encoded[0]),
-            ("dialMode", variant.dial_mode, encoded[1]),
-        ):
-            name = f"VARIANTS[{index}].{field}"
+        for key, value, raw in zip(VARIANT_KEYS, variant, encoded):
             if quote(value, safe="") != raw:
-                raise AssertionError(f"{name} does not round-trip through percent-encoding")
-        # fm is retyped by hand whenever a fragment is tuned, and it is the one
-        # value the health check never exercises -- nodes are tested without it.
-        # Left to the preflight, a JSON typo surfaces as a JSONDecodeError out
-        # of Node.to_outbound rather than as a message about this line.
+                raise AssertionError(
+                    f"VARIANTS[{index}].{key} does not round-trip through percent-encoding"
+                )
+        # fm is retyped by hand whenever a fragment is tuned, and it is never
+        # exercised by the health check -- nodes are tested without it. Left
+        # to the preflight, a JSON typo surfaces as a JSONDecodeError out of
+        # Node.to_outbound rather than as a message about this line.
         if variant.fm:
             try:
                 json.loads(variant.fm)
@@ -201,11 +363,29 @@ def _self_check() -> None:
                 raise AssertionError(
                     f"VARIANTS[{index}].fm is not valid JSON: {error}"
                 ) from None
+        # The health check never sees ech or echOutbound either, and the core
+        # only parses ech when it dials, so a mistake in either would ship as a
+        # list whose every config fails. Both are held to the rules the core
+        # and the two clients apply.
+        if variant.ech:
+            problem = ech_problem(variant.ech)
+            if problem:
+                raise AssertionError(f"VARIANTS[{index}].ech: {problem}")
+        if variant.ech_outbound:
+            problem = ech_outbound_problem(variant.ech_outbound, variant.ech)
+            if problem:
+                raise AssertionError(f"VARIANTS[{index}].echOutbound {problem}")
+        # An unknown fp fails the preflight -- the core refuses it at load, from
+        # a list it keeps itself. An unknown cs does not, so it is checked here.
+        if variant.cs:
+            problem = cs_problem(variant.cs)
+            if problem:
+                raise AssertionError(f"VARIANTS[{index}].cs {problem}")
 
-    # Two identical pairs would publish the same link twice, which is the one
+    # Two identical entries would publish the same link twice, which is the one
     # thing the rest of this pipeline works hardest to avoid.
     if len(set(VARIANTS)) != len(VARIANTS):
-        raise AssertionError("VARIANTS repeats a pair, which would publish duplicate configs")
+        raise AssertionError("VARIANTS repeats an entry, which would publish duplicate configs")
 
     for name, port in (
         ("HEALTHCHECK_PORT", HEALTHCHECK_PORT),
@@ -313,10 +493,13 @@ def rule_10_point_at_output(node: Node) -> None:
     node.port = str(OUTPUT_PORT)
 
 
-# --- rule 11: strip certificate opt-outs and ECH --------------------------
+# --- rule 11: strip certificate opt-outs --------------------------------
 
 # Everything rule 11 removes from every node, whatever its spelling or case.
-STRIPPED_KEYS = INSECURE_KEYS + ECH_KEYS
+# It used to take ech as well. ech is still removed before the health check --
+# it is one of the DEFERRED_KEYS now -- but it is no longer thrown away: a
+# variant can put this project's own ech back on the survivors.
+STRIPPED_KEYS = INSECURE_KEYS
 
 
 def rule_11_strip_insecure(node: Node) -> None:
@@ -329,11 +512,13 @@ def rule_11_strip_insecure(node: Node) -> None:
 
 
 def strip_deferred_params(node: Node) -> None:
-    """Remove whatever the source supplied for fm or dialMode.
+    """Remove whatever the source supplied for fm, dialMode, ech, echOutbound,
+    fp or cs.
 
-    The health check has to run on nodes carrying neither, so that what it
-    measures is the node rather than one source's idea of how to fragment.
-    :func:`apply_deferred_params` puts this project's values on afterwards.
+    The health check has to run on nodes carrying none of them, so that what it
+    measures is the node rather than one source's idea of how to fragment,
+    dial, hide the SNI, or shape the ClientHello. :func:`apply_deferred_params` puts this project's
+    values on afterwards.
     """
     for key in list(node.params):
         if key.lower() in DEFERRED_KEYS:
@@ -341,36 +526,58 @@ def strip_deferred_params(node: Node) -> None:
 
 
 def apply_deferred_params(node: Node, variant: int = 0) -> None:
-    """Put one variant's fm and dialMode on a node that has already passed.
+    """Put one variant's fm, dialMode, ech, echOutbound, fp and cs on a node
+    that has already passed.
 
-    ``variant`` indexes :data:`VARIANTS`, whose entries are (fm, dialMode)
-    pairs, so the two always travel as the pair they were written as.
+    ``variant`` indexes :data:`VARIANTS`, so the six always travel as the
+    entry they were written as, each under the exact key in VARIANT_KEYS.
 
-    An empty entry means "publish without it": nothing is written. For dialMode
+    An empty field means "publish without it": nothing is written. For dialMode
     that is not a compromise -- the core treats an absent dialMode and
     dialMode="" identically -- and :func:`strip_deferred_params` has already
     guaranteed the node is not carrying a stale value from its source, so an
-    empty entry really does publish the default.
+    empty field really does publish the default.
     """
-    pair = VARIANTS[variant]
-    if pair.fm:
-        node.set("fm", pair.fm)
-    if pair.dial_mode:
-        node.set("dialMode", pair.dial_mode)
+    for key, value in zip(VARIANT_KEYS, VARIANTS[variant]):
+        if value:
+            node.set(key, value)
 
 
-# --- rule 12: masking parameters ------------------------------------------
+# --- SNI -------------------------------------------------------------------
+# Rule 12's values -- fp, cs and fm -- are variant fields now, put on the
+# survivors by apply_deferred_params. What stays before the check is the SNI
+# normalisation that used to ride along with them.
 
 
-def rule_12_apply_masking(node: Node) -> None:
-    """The masking the health check exercises. Every node is TLS by now, so it
-    applies to all of them. ``fm`` is deliberately not here -- see
-    :func:`apply_deferred_params`."""
-    node.set("fp", FP)
-    node.set("cs", CS)
-    # NORMALISATION: rule 10 puts a Cloudflare IP in the address field, and
-    # Cloudflare selects the origin by SNI, so SNI has to be the fronted host.
+def normalise_sni(node: Node) -> None:
+    """NORMALISATION: rule 10 puts a Cloudflare IP in the address field, and
+    Cloudflare selects the origin by SNI, so SNI has to be the fronted host --
+    for the health check as much as for what is published."""
     node.set("sni", node.host)
+
+
+# --- ALPN for the HTTP/1.1 Upgrade transports --------------------------------
+# WebSocket and httpupgrade both open with an HTTP/1.1 Upgrade request, so a
+# node on either that offers h2 lets Cloudflare pick a protocol the handshake
+# cannot run over. The core does not prevent it: both dialers ask for http/1.1
+# only when the config sets no ALPN at all (tls.WithNextProto in
+# transport/internet/websocket and .../httpupgrade), so a source's "h2" or
+# "h2,http/1.1" goes out exactly as written.
+HTTP1_ALPN = "http/1.1"
+HTTP1_UPGRADE_TRANSPORTS = WS_ALIASES + ("httpupgrade",)
+
+
+def normalise_upgrade_alpn(node: Node) -> None:
+    """NORMALISATION: every ws or httpupgrade node offers exactly http/1.1,
+    whatever its source said -- or added when it said nothing.
+
+    The old key is popped rather than overwritten so the link always carries it
+    as "alpn": Node.set keeps an existing key's spelling, and a source's "ALPN"
+    would otherwise reach the published link.
+    """
+    if node.transport in HTTP1_UPGRADE_TRANSPORTS:
+        node.pop("alpn")
+        node.set("alpn", HTTP1_ALPN)
 
 
 # --- naming ---------------------------------------------------------------
@@ -380,7 +587,7 @@ def rule_12_apply_masking(node: Node) -> None:
 # cannot tell two nodes apart and are left out of the name hash below. That is
 # what keeps a node's published name stable when an address, a mask or a
 # dialMode is changed here: only a genuinely different node gets a new name.
-INJECTED_KEYS = ("fp", "cs", "sni") + DEFERRED_KEYS
+INJECTED_KEYS = ("sni",) + DEFERRED_KEYS
 
 
 def naming_identity(node: Node) -> tuple:
@@ -427,8 +634,8 @@ def make_tag(node: Node, variant: int = 0) -> str:
     configs.txt -- including across a change of exit address or masking, and
     across this project re-reading its own output.
 
-    ``variant`` is mixed in so that a node published under several fm/dialMode
-    pairs does not appear in a client several times under one name, which would
+    ``variant`` is mixed in so that a node published under several variants
+    does not appear in a client several times under one name, which would
     make the variants impossible to tell apart -- and choosing between them is
     the point of publishing more than one. The index is mixed in rather than
     the fm and dialMode values themselves, so that retuning a fragment still
@@ -457,7 +664,8 @@ def transform(nodes: list[Node], stats: dict | None = None) -> list[Node]:
     """Apply rules 1-12 and return the deduplicated pool, ready to be tested.
 
     Every node that comes back is TLS, points at the health-check endpoint,
-    carries fp and cs, and carries neither fm nor dialMode.
+    names its host as SNI, offers only http/1.1 if it is ws or httpupgrade, and
+    carries none of the six variant fields.
     """
     counts: dict = stats if stats is not None else {}
 
@@ -504,7 +712,8 @@ def transform(nodes: list[Node], stats: dict | None = None) -> list[Node]:
         rule_10_point_at_healthcheck(node)
         rule_11_strip_insecure(node)
         strip_deferred_params(node)
-        rule_12_apply_masking(node)
+        normalise_sni(node)
+        normalise_upgrade_alpn(node)
 
     deduped: list[Node] = []
     seen: set[tuple] = set()
@@ -549,6 +758,6 @@ def finalise(nodes: list[Node], stats: dict | None = None) -> list[Node]:
             published.append(copy)
     counts["published"] = len(published)
     counts["published_variants"] = len(VARIANTS)
-    counts["published_with_fm"] = sum(1 for node in published if node.has("fm"))
-    counts["published_with_dial_mode"] = sum(1 for node in published if node.has("dialMode"))
+    for key in VARIANT_KEYS:
+        counts[f"published_with_{key}"] = sum(1 for node in published if node.has(key))
     return published

@@ -28,11 +28,6 @@ WS_ALIASES = ("ws", "websocket")
 # the wild. Rule 11 strips all of them.
 INSECURE_KEYS = ("allowinsecure", "allow_insecure", "insecure")
 
-# Encrypted Client Hello. Rule 11 strips this too: ECH encrypts the SNI, and
-# rule 12 sets the SNI to the fronted host precisely so Cloudflare can route on
-# it. The values seen in these lists ("ip.gs+udp://8.8.8.8") also make the
-# client fetch an ECH config over DNS before it can connect at all.
-ECH_KEYS = ("ech",)
 
 # Stable emit order, so an unchanged upstream produces a byte-identical
 # configs.txt and the daily commit is a real diff rather than noise.
@@ -50,6 +45,8 @@ PARAM_ORDER = (
     "cs",
     "fm",
     "dialMode",
+    "ech",
+    "echOutbound",
     "flow",
     "headerType",
     "packetEncoding",
@@ -211,15 +208,26 @@ class Node:
 
     # -- Xray outbound ----------------------------------------------------
 
+    def ech_outbound(self) -> dict | None:
+        """The ``echOutbound`` share-link parameter, parsed: a whole Xray
+        outbound, written as JSON, that the ECH config query is sent through.
+
+        None when the node carries none. Invalid JSON raises rather than being
+        skipped -- transform._self_check validates every value this project
+        publishes, so reaching here with a broken one is a bug worth seeing.
+        """
+        raw = self.get("echOutbound")
+        return json.loads(raw) if raw else None
+
     def to_outbound(self, tag: str) -> dict:
         """Render this node as an Xray-core outbound object.
 
         Mirrors whatever the node carries, including the share-link extensions
-        ``fp`` (fingerprint), ``cs`` (cipherSuites), ``fm`` (finalmask) and
-        ``dialMode`` (a sockopt). Which of those are present depends on the
-        stage: the health check runs on nodes that carry fp and cs but not fm
-        or dialMode, and transform.finalise adds the other two to the
-        survivors. See scripts/transform.py for why the pipeline is split that
+        ``fp`` (fingerprint), ``cs`` (cipherSuites), ``fm`` (finalmask),
+        ``dialMode`` (a sockopt), ``ech`` (echConfigList) and ``echOutbound``
+        (the echSockopt dialer). Which are present depends on the stage: the
+        health check runs on nodes carrying none of the six, over the core's
+        plain TLS, and transform.finalise adds them to the survivors. See scripts/transform.py for why the pipeline is split that
         way.
         """
         net = self.transport
@@ -237,6 +245,16 @@ class Node:
                 tls["cipherSuites"] = self.get("cs")
             if self.get("alpn"):
                 tls["alpn"] = [a for a in self.get("alpn").split(",") if a]
+            if self.get("ech"):
+                # Stored as-is by the core, which only parses it when it dials.
+                tls["echConfigList"] = self.get("ech")
+            ech_outbound = self.ech_outbound()
+            if ech_outbound is not None:
+                # What PattN and PattNG do with echOutbound: the ECH config
+                # query is dialled through that outbound, found by its tag. The
+                # outbound itself has to be added to the config beside this one
+                # -- see healthcheck.preflight, the only place that renders it.
+                tls["echSockopt"] = {"dialerProxy": ech_outbound["tag"]}
             stream["tlsSettings"] = tls
         else:
             stream["security"] = "none"

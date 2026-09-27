@@ -236,7 +236,7 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
         f"#profile-web-page-url: {PROFILE_PAGE}",
         (
             f"# {len(links)} configs from {len(links) // counts['published_variants']} healthy nodes"
-            f" x {counts['published_variants']} fm/dialMode variants,"
+            f" x {counts['published_variants']} variants,"
             f" tested from {counts.get('final_total', 0)}"
             if counts.get("published_variants", 1) > 1
             else f"# {len(links)} nodes, from {counts.get('final_total', 0)} tested"
@@ -256,14 +256,11 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
     # Say plainly what was tested and what was not: fm and dialMode go on after
     # the check, so the criterion above is a claim about the nodes, not about
     # the masking they ship with.
-    deferred = [
-        name
-        for name, key in (("fm", "published_with_fm"), ("dialMode", "published_with_dial_mode"))
-        if counts.get(key)
-    ]
+    deferred = [key for key in transform.VARIANT_KEYS if counts.get(f"published_with_{key}")]
     if deferred:
+        listed = ", ".join(deferred[:-1]) + " and " + deferred[-1] if len(deferred) > 1 else deferred[0]
         header.append(
-            f"# {' and '.join(deferred)} applied after testing, to nodes that had already passed"
+            f"# {listed} applied after testing, to nodes that had already passed"
         )
     if "flaky_percent" in counts:
         header.append(
@@ -399,7 +396,7 @@ def main() -> int:
     variants = counts.get("published_variants", 1)
     print(
         f"Finalising {len(healthy)} healthy nodes"
-        + (f" x {variants} fm/dialMode variants = {len(published)} configs" if variants > 1 else "")
+        + (f" x {variants} variants = {len(published)} configs" if variants > 1 else "")
         + f", publishing on {transform.OUTPUT_ADDRESS}:{transform.OUTPUT_PORT}"
     )
 

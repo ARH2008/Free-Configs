@@ -2,15 +2,15 @@
 
 Reimplements the criterion the upstream project publishes in its own header --
 "a real proxied request to https://cp.cloudflare.com/generate_204 succeeded in
-ALL 3 independent runs" -- directly against Xray-core rather than a wrapper, so
-the ``fp=unsafe`` and ``cs`` parameters in the emitted links are the ones being
-exercised.
+ALL 3 independent runs" -- directly against Xray-core rather than a wrapper.
 
-The nodes reaching this stage deliberately carry no ``fm`` or ``dialMode``:
-those change how a connection is made rather than whether the node works, and
-transform.finalise adds them to the survivors afterwards. :func:`preflight`
-therefore validates the published shape as well as the tested one, because
-nothing else in the pipeline ever feeds an ``fm`` to the core.
+The nodes reaching this stage deliberately carry none of ``fm``, ``dialMode``,
+``ech``, ``echOutbound``, ``fp`` or ``cs``: those shape how a connection is made
+rather than whether the node works, so the check runs over the core's plain
+TLS and transform.finalise adds them to the survivors afterwards.
+:func:`preflight` therefore validates every published shape as well as the
+tested one, because nothing else in the pipeline ever hands those six to the
+core.
 
 Shape of a round: nodes are grouped into batches; each batch becomes one Xray
 process with one loopback HTTP inbound per node, routed to that node's outbound.
@@ -268,21 +268,37 @@ def preflight(xray: str) -> list[str]:
     failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix="xray-preflight-") as directory:
         for description, node in preflight_probes():
-            config = _build_config([node], _placeholder_ports(1))
-            if not _config_accepted(xray, config, directory):
+            if not _config_accepted(xray, _preflight_config(node), directory):
                 failures.append(description)
     return failures
+
+
+def _preflight_config(node: Node) -> dict:
+    """The config a preflight probe is validated as.
+
+    An echOutbound is a whole outbound that PattN and PattNG add to the config
+    for the node's echSockopt to dial through, so it is added here the same way.
+    That is what gets the outbound itself -- its protocol and its settings --
+    validated by the core: echSockopt.dialerProxy is only a tag at load time,
+    and a config pointing at an outbound that is not there still passes
+    ``run -test``. The health check's own configs never carry one.
+    """
+    config = _build_config([node], _placeholder_ports(1))
+    ech_outbound = node.ech_outbound()
+    if ech_outbound is not None:
+        config["outbounds"].append(ech_outbound)
+    return config
 
 
 def preflight_probes() -> list[tuple[str, Node]]:
     """The two shapes this pipeline produces: what the health check runs, and
     what the subscription publishes.
 
-    They differ, so both are worth proving. The tested shape carries ``fp`` and
-    ``cs``; each published shape adds one variant's ``fm`` and ``dialMode`` on
-    top and points at the output endpoint. Every variant gets its own probe,
-    because an unusable ``fm`` would otherwise reach configs.txt unchallenged --
-    the health check never sees one.
+    They differ, so both are worth proving. The tested shape is plain TLS;
+    each published shape adds one variant's six fields on top and points at
+    the output endpoint. Every variant gets its own probe, because an unusable
+    ``fm``, ``echOutbound`` or ``fp`` would otherwise reach configs.txt
+    unchallenged -- the health check never sees any of them.
 
     Both take their address, port and parameter values from transform's own
     constants rather than writing them out again, so repointing an endpoint or
@@ -297,8 +313,6 @@ def preflight_probes() -> list[tuple[str, Node]]:
             "host": "example.com",
             "path": "/",
             "sni": "example.com",
-            "fp": transform.FP,
-            "cs": transform.CS,
         }
         params.update({k: v for k, v in extra.items() if v})
         return Node(
@@ -311,24 +325,31 @@ def preflight_probes() -> list[tuple[str, Node]]:
 
     probes = [
         (
-            "tested shape (fp=unsafe + cs cipherSuites)",
+            "tested shape (plain TLS, none of the variant fields)",
             probe(transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT),
         )
     ]
     total = len(transform.VARIANTS)
     for index, variant in enumerate(transform.VARIANTS):
-        carries = "fm fragment" if variant.fm else "no fm"
+        carries = ["fm fragment" if variant.fm else "no fm"]
         if variant.dial_mode:
-            carries += f" + dialMode {variant.dial_mode}"
+            carries.append(f"dialMode {variant.dial_mode}")
+        if variant.ech:
+            carries.append("ech")
+        if variant.ech_outbound:
+            carries.append("echOutbound")
+        if variant.fp:
+            carries.append(f"fp {variant.fp}")
+        if variant.cs:
+            carries.append("cs")
         where = f" {index + 1}/{total}" if total > 1 else ""
         probes.append(
             (
-                f"published shape{where} ({carries})",
+                f"published shape{where} ({' + '.join(carries)})",
                 probe(
                     transform.OUTPUT_ADDRESS,
                     transform.OUTPUT_PORT,
-                    fm=variant.fm,
-                    dialMode=variant.dial_mode,
+                    **dict(zip(transform.VARIANT_KEYS, variant)),
                 ),
             )
         )
