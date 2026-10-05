@@ -31,6 +31,18 @@ import build  # noqa: E402
 import transform  # noqa: E402
 from nodes import Node, parse_line  # noqa: E402
 
+# The variants this repository ships. Almost every test below is about how the
+# pipeline works, not about which variants happen to be configured, so they run
+# against the first shipped variant alone. Without that, adding a variant to
+# transform.py -- which is what the list is for -- would break tests that have
+# nothing to do with it, and CI runs this suite before it builds. The shipped
+# list itself is checked in its own section, and the end-to-end build.py runs,
+# which read the real transform.py, expect one line per shipped variant.
+SHIPPED_VARIANTS = transform.VARIANTS
+SHIPPED_VARIANTS_ENCODED = transform.VARIANTS_ENCODED
+transform.VARIANTS = SHIPPED_VARIANTS[:1]
+transform.VARIANTS_ENCODED = SHIPPED_VARIANTS_ENCODED[:1]
+
 FAILURES: list[str] = []
 PASSED = 0
 
@@ -1059,12 +1071,12 @@ finally:
 # Every percent-encoded field of every variant, by name: ip and port are
 # written plainly and so are not part of this; security is.
 constant_pairs = []
-for _i, (_v, _e) in enumerate(zip(transform.VARIANTS, transform.VARIANTS_ENCODED)):
+for _i, (_v, _e) in enumerate(zip(SHIPPED_VARIANTS, SHIPPED_VARIANTS_ENCODED)):
     _encoded = dict(zip(transform.Variant._fields, _e))
     for _field in transform.Variant._fields[2:]:
         constant_pairs.append((f"VARIANTS[{_i}].{_field}", _encoded[_field], getattr(_v, _field)))
-check(len(constant_pairs) == (len(transform.Variant._fields) - 2) * len(transform.VARIANTS),
-      "constants: every encoded field of every variant is round-tripped")
+check(len(constant_pairs) == (len(transform.Variant._fields) - 2) * len(SHIPPED_VARIANTS),
+      "constants: every encoded field of every shipped variant is round-tripped")
 for name, encoded, decoded in constant_pairs:
     check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
 
@@ -1411,6 +1423,30 @@ finally:
     healthcheck.PAUSE_BETWEEN_ROUNDS = real_pause
     # Leaving this stubbed would silently feed the endpoint tests below.
     healthcheck.usable_endpoints = real_usable_endpoints
+
+# --- the variants this repository ships ---------------------------------------
+# Everything else runs against the first shipped variant alone; this is where
+# the list as configured in transform.py is held to account. _self_check has
+# already accepted it on import, so what is left is what that cannot know.
+check(len(SHIPPED_VARIANTS) >= 1, "shipped: at least one variant is configured")
+check(len(set(SHIPPED_VARIANTS)) == len(SHIPPED_VARIANTS), "shipped: no variant is listed twice")
+real_variants_shipped = transform.VARIANTS
+try:
+    transform.VARIANTS = SHIPPED_VARIANTS
+    shipped_probes = healthcheck.preflight_probes()
+    check(len(shipped_probes) == 1 + len(SHIPPED_VARIANTS),
+          "shipped: the preflight probes the tested shape and every shipped variant")
+    check([(node.address, node.port, node.get("security")) for _, node in shipped_probes[1:]]
+          == [(v.ip, v.port, v.security) for v in SHIPPED_VARIANTS],
+          "shipped: each shipped variant is probed on its own endpoint and security")
+    # Built here rather than with survivors(): the health-check tests above
+    # reuse that name for a list.
+    two_nodes = [n for i in range(2) for n in one(**{**BASE, "host": f"s{i}.example"})]
+    shipped_names = [n.tag for n in transform.finalise(two_nodes, {})]
+    check(len(shipped_names) == 2 * len(SHIPPED_VARIANTS) == len(set(shipped_names)),
+          "shipped: every shipped variant of every node gets a name of its own")
+finally:
+    transform.VARIANTS = real_variants_shipped
 
 # The preflight has to exercise both shapes the pipeline emits -- the one the
 # health check runs and the one the subscription publishes -- or it proves
@@ -1884,8 +1920,13 @@ check("unreachable source" in completed.stdout, "sources: the dead source is rep
 # it after the health check.
 completed, _, produced = run_build(serve(GOOD_BODY))
 emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
-check(completed.returncode == 0 and len(emitted) == 1,
-      "finalise: the build publishes the one node it was given")
+check(completed.returncode == 0 and len(emitted) == len(SHIPPED_VARIANTS),
+      "finalise: the build publishes the one node it was given, once per shipped variant")
+check(all(
+    (node.address, node.port, node.security) == (variant.ip, variant.port, variant.security)
+    and all(node.get(key) == value for key, value in variant.params.items())
+    for node, variant in zip((parse_line(line) for line in emitted), SHIPPED_VARIANTS)
+), "finalise: each published line carries its own shipped variant, in order")
 published = parse_line(emitted[0])
 check(published.get("fm") == transform.VARIANTS[0].fm,
       "finalise: build.py adds fm to what it publishes")
@@ -1928,7 +1969,8 @@ check(completed.returncode == 0, "dedup: the four-copy list builds")
 check("1 distinct configs parsed" in completed.stdout,
       "dedup: four spellings of one node collapse to one")
 check("3 duplicates dropped" in completed.stdout, "dedup: the other three are counted as repeats")
-check(len(emitted) == 1, "dedup: four spellings of one node yield one published node")
+check(len(emitted) == len(SHIPPED_VARIANTS),
+      "dedup: four spellings of one node yield one published node per variant")
 # Names are percent-encoded on the wire, so decode before comparing.
 names = [parse_line(l).tag for l in emitted]
 check(all(n.startswith("FIRST NAME") for n in names),
@@ -1954,15 +1996,17 @@ SIX = "".join(
 completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="4")
 capped = [l for l in produced.splitlines() if l and not l.startswith("#")]
 check(completed.returncode == 0, "cap: a capped build succeeds")
-check(len(capped) == 4, "cap: the build tests only the capped number of nodes")
+check(len(capped) == 4 * len(SHIPPED_VARIANTS),
+      "cap: the build tests only the capped number of nodes")
 check("capped to 4 nodes" in completed.stdout, "cap: the build reports that it capped")
 check("2 dropped" in completed.stdout, "cap: the build reports how many it dropped")
-check(all(parse_line(l).port == "443" for l in capped),
-      "cap: everything published is on 443")
+check([parse_line(l).port for l in capped] == [v.port for v in SHIPPED_VARIANTS] * 4,
+      "cap: everything published is on its variant's port")
 
 # Under the cap, nothing is dropped and nothing is reported.
 completed, _, produced = run_build(serve(SIX), MAX_NODES_TO_TEST="500")
-check(len([l for l in produced.splitlines() if l and not l.startswith("#")]) == 6,
+check(len([l for l in produced.splitlines() if l and not l.startswith("#")])
+      == 6 * len(SHIPPED_VARIANTS),
       "cap: a pool under the limit is published whole")
 check("capped to" not in completed.stdout, "cap: no cap message when the limit is not reached")
 
@@ -1978,10 +2022,10 @@ completed, _, produced = run_build(
     serve(GOOD_BODY) + "," + serve(base64.b64encode(GOOD_BODY))
 )
 check(completed.returncode == 0, "sources: a base64 source is accepted")
-# One input node listed by both sources must yield exactly two output nodes --
-# itself and its rule 9 mirror -- not four.
+# One input node listed by both sources is one node, published once per
+# shipped variant -- not twice per variant.
 emitted = [l for l in produced.splitlines() if l and not l.startswith("#")]
-check(len(emitted) == 1, "sources: the same node from two sources is deduped")
+check(len(emitted) == len(SHIPPED_VARIANTS), "sources: the same node from two sources is deduped")
 # Node-level dedup would collapse these anyway, so assert the line-level pass
 # actually ran -- it is what keeps a large overlapping source from being
 # parsed twice.
@@ -1990,8 +2034,8 @@ check(
     and "1 duplicates dropped" in completed.stdout,
     "sources: a repeated node is dropped once, not parsed twice",
 )
-check(parse_line(emitted[0]).port == "443",
-      "sources: the surviving node is published on 443")
+check(parse_line(emitted[0]).port == SHIPPED_VARIANTS[0].port,
+      "sources: the surviving node is published on its variant's port")
 
 for sock in SERVERS:
     sock.close()
