@@ -61,6 +61,16 @@ https://github.com/MatinGhanbari/v2ray-configs
 
 https://github.com/SoliSpirit/v2ray-configs
 
+https://github.com/ripaojiedian/freenode
+
+https://github.com/Pawdroid/Free-servers
+
+https://github.com/Leon406/SubCrawler
+
+https://github.com/ermaozi/get_subscribe
+
+https://github.com/peasoft/NoMoreWalls
+
 
 ## حمایت
 
