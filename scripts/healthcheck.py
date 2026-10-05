@@ -295,8 +295,8 @@ def preflight_probes() -> list[tuple[str, Node]]:
     what the subscription publishes.
 
     They differ, so both are worth proving. The tested shape is plain TLS;
-    each published shape adds one variant's six fields on top and points at
-    the output endpoint. Every variant gets its own probe, because an unusable
+    each published shape adds one variant's six parameters on top and points
+    at that variant's ip and port. Every variant gets its own probe, because an unusable
     ``fm``, ``echOutbound`` or ``fp`` would otherwise reach configs.txt
     unchallenged -- the health check never sees any of them.
 
@@ -315,6 +315,11 @@ def preflight_probes() -> list[tuple[str, Node]]:
             "sni": "example.com",
         }
         params.update({k: v for k, v in extra.items() if v})
+        if params["security"] != "tls":
+            # A plaintext variant publishes without these TLS extensions, as
+            # transform.set_published_security does, so it is probed without.
+            for key in transform.TLS_ONLY_KEYS:
+                params.pop(key, None)
         return Node(
             scheme="vless",
             uid="00000000-0000-0000-0000-000000000000",
@@ -331,7 +336,7 @@ def preflight_probes() -> list[tuple[str, Node]]:
     ]
     total = len(transform.VARIANTS)
     for index, variant in enumerate(transform.VARIANTS):
-        carries = ["fm fragment" if variant.fm else "no fm"]
+        carries = [variant.security, "fm fragment" if variant.fm else "no fm"]
         if variant.dial_mode:
             carries.append(f"dialMode {variant.dial_mode}")
         if variant.ech:
@@ -345,12 +350,9 @@ def preflight_probes() -> list[tuple[str, Node]]:
         where = f" {index + 1}/{total}" if total > 1 else ""
         probes.append(
             (
-                f"published shape{where} ({' + '.join(carries)})",
-                probe(
-                    transform.OUTPUT_ADDRESS,
-                    transform.OUTPUT_PORT,
-                    **dict(zip(transform.VARIANT_KEYS, variant)),
-                ),
+                f"published shape{where} on {transform.endpoint_text(variant.ip, variant.port)}"
+                f" ({' + '.join(carries)})",
+                probe(variant.ip, variant.port, security=variant.security, **variant.params),
             )
         )
     return probes

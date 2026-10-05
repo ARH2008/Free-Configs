@@ -47,6 +47,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import ipaddress
 import json
 import re
 from typing import NamedTuple
@@ -55,16 +56,14 @@ from urllib.parse import quote, unquote
 from nodes import INSECURE_KEYS, WS_ALIASES, Node
 
 # --- rule 10: where nodes point -------------------------------------------
-# Two independent pairs. The endpoint a node is *tested* through does not have
-# to be the endpoint it is *published* on: the health check proves the node
-# answers behind Cloudflare, and which Cloudflare address the published link
-# names is a separate decision that can be changed without re-testing. Set both
-# pairs to the same values for the old single-endpoint behaviour, which is
-# what they hold today.
+# Every node is *tested* through this one fixed endpoint. Where it is
+# *published* is a different decision, made per variant -- each entry of
+# VARIANTS below names its own ip and port -- because the health check proves
+# the node answers behind Cloudflare, and that stays true whichever Cloudflare
+# address a published link names. So a node tested once can be published on as
+# many addresses as there are variants, and they can change without re-testing.
 HEALTHCHECK_ADDRESS = "188.114.97.6"
 HEALTHCHECK_PORT = "443"
-OUTPUT_ADDRESS = "188.114.97.6"
-OUTPUT_PORT = "443"
 
 # --- rules 4-6: port buckets ---------------------------------------------
 PORTS_MAPPED_TO_443 = ("443", "2053", "2083", "2087", "2096", "8443")
@@ -74,10 +73,26 @@ PORTS_MAPPED_TO_8080 = ("80", "8080", "8880", "2052", "2082", "2086", "2095")
 ALLOWED_SECURITY = ("", "tls", "none")
 ALLOWED_TRANSPORTS = ("ws", "xhttp", "websocket", "httpupgrade", "grpc")
 
-# --- parameters applied AFTER the health check ----------------------------
-# Six share-link parameters that shape *how* a connection is made rather than
-# *whether* a node carries traffic, so the health check runs without any of
-# them -- over the core's plain TLS -- and they are put on the survivors:
+# --- fields applied AFTER the health check --------------------------------
+# A variant is nine fields put on every survivor. Three say where and how the
+# published link connects:
+#
+#   ip, port     the address and port of the link itself -- not query
+#                parameters, so they are written plainly below, not
+#                percent-encoded. ip may be IPv4, IPv6 (without brackets; the
+#                link adds them) or a hostname.
+#   security     "tls" or "none". Every node is tested over TLS whatever this
+#                says; it only decides what is published. It fixes which
+#                ports are usable, exactly as rules 7 and 8 do on the way in:
+#                tls needs one of Cloudflare's HTTPS ports (PORTS_MAPPED_TO_443),
+#                none one of its HTTP ports (PORTS_MAPPED_TO_8080). A none
+#                variant cannot carry ech, echOutbound, fp or cs -- they only
+#                exist inside TLS -- and its links drop the node's sni and alpn
+#                for the same reason.
+#
+# The other six are share-link parameters that shape *how* a connection is
+# made rather than *whether* a node carries traffic, so the health check runs
+# without any of them -- over the core's plain TLS, to HEALTHCHECK_ADDRESS:
 #
 #   fm           finalmask -- splits the outgoing packets
 #   dialMode     streamSettings.sockopt.dialMode, which dialing code the core
@@ -94,13 +109,15 @@ ALLOWED_TRANSPORTS = ("ws", "xhttp", "websocket", "httpupgrade", "grpc")
 #   fp           tlsSettings.fingerprint -- the uTLS ClientHello to imitate
 #   cs           tlsSettings.cipherSuites -- colon-separated Go suite names
 #
-# They travel together as one list of variants, so the six can never drift
+# They travel together as one list of variants, so the nine can never drift
 # out of step. Every healthy node is published once per variant, its variants
 # adjacent, so N healthy nodes and I variants become N * I lines -- still one
 # configs.txt and one configs_base64.txt. With a single variant, which is the
-# default, that is one line per node exactly as before.
+# default, that is one line per node exactly as before. To publish every node
+# on several addresses, add variants that differ only in ip (and port).
 #
-# An entry of "" publishes that parameter's default: nothing is written for it.
+# For the six parameters, "" publishes that parameter's default: nothing is
+# written for it. ip, port and security always need a value.
 # For dialMode that costs nothing, because an absent dialMode and dialMode=""
 # are the same thing to the core -- both run the default dialer.
 #
@@ -120,19 +137,36 @@ ALLOWED_TRANSPORTS = ("ws", "xhttp", "websocket", "httpupgrade", "grpc")
 class Variant(NamedTuple):
     """One published flavour of every healthy node."""
 
+    ip: str
+    port: str
     fm: str
     dial_mode: str
+    security: str
     ech: str
     ech_outbound: str
     fp: str
     cs: str
 
+    @property
+    def params(self) -> dict[str, str]:
+        """The six share-link parameters stripped before the check and put back
+        after it, under the keys they are written as. Not ip and port, which
+        are the link's address, nor security, which overrides a value the
+        check itself needs rather than being withheld from it."""
+        return {key: getattr(self, field) for field, key in zip(PARAM_FIELDS, VARIANT_KEYS)}
 
-# Add a variant by adding an entry. Each is (fm, dialMode, ech, echOutbound,
-# fp, cs), percent-encoded exactly as it will be emitted; "" for any of them
-# publishes that one's default. Write echOutbound as compact JSON on one line.
+
+# Add a variant by adding an entry. Each is (ip, port, fm, dialMode, security,
+# ech, echOutbound, fp, cs): ip and port written plainly, the rest
+# percent-encoded exactly as they will be emitted, "" for any of the six
+# parameters publishing that one's default. Write echOutbound as compact JSON
+# on one line.
 VARIANTS_ENCODED = [
     (
+        # ip
+        "188.114.97.6",
+        # port
+        "443",
         # fm
         "%7B%22tcp%22%3A%20%5B%7B%22type%22%3A%20%22fragment%22%2C%20%22settings%22%3A%20%7B%22"
         "packets%22%3A%20%22tlshello%22%2C%20%22lengths%22%3A%20%5B%220%22%2C%20%22104%22%2C%20%22"
@@ -142,6 +176,8 @@ VARIANTS_ENCODED = [
         "%20%22maxSplit%22%3A%20%2211%22%7D%7D%5D%7D",
         # dialMode
         "",
+        # security
+        "tls",
         # ech
         "",
         # echOutbound
@@ -158,10 +194,22 @@ VARIANTS_ENCODED = [
     ),
 ]
 
-# The share-link keys of each Variant field, in field order: the spelling
-# :func:`apply_deferred_params` writes and both clients read. PattNG looks
+# The share-link keys of the six parameter fields -- every Variant field after
+# ip and port -- in field order: the spelling :func:`apply_deferred_params`
+# writes and both clients read. PattNG looks
 # echOutbound up with an exact-case map key, so the casing here is load-bearing.
 VARIANT_KEYS = ("fm", "dialMode", "ech", "echOutbound", "fp", "cs")
+
+# The Variant field each of those keys is read from -- by name, so the order
+# fields are written in never decides which value lands under which key.
+PARAM_FIELDS = ("fm", "dial_mode", "ech", "ech_outbound", "fp", "cs")
+
+# What a variant may publish, and the fields only TLS can carry.
+SECURITY_VALUES = ("tls", "none")
+TLS_ONLY_FIELDS = ("ech", "ech_outbound", "fp", "cs")
+# Parameters the pipeline sets on every node that mean nothing without TLS, so
+# a security=none link leaves them out.
+TLS_ONLY_KEYS = ("sni", "alpn")
 
 # The six parameters :func:`finalise` owns, in every spelling. They are removed
 # on the way in and set on the way out, so whatever a source supplied has no
@@ -295,13 +343,58 @@ def ech_outbound_problem(value: str, ech: str) -> str | None:
     return None
 
 
+# A hostname, label by label: what a share link's address may be when it is
+# not an IP.
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)(?:\.(?!-)[A-Za-z0-9-]{1,63}(?<!-))*"
+)
+
+
+def endpoint_problem(ip: str, port: str, security: str = "tls") -> str | None:
+    """Why a config with this ``security`` could not point at ``ip``:``port``,
+    or None."""
+    if not ip or ip != ip.strip():
+        return "the address is empty or has spaces around it"
+    if ip.startswith("["):
+        return f"{ip!r}: write an IPv6 address without brackets -- the link adds them"
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        # Not an IP. A hostname is fine -- a share link takes either -- but a
+        # dotted run of digits that does not parse is a mistyped IPv4 address,
+        # not a name anyone means.
+        if re.fullmatch(r"[0-9.]+", ip):
+            return f"{ip!r} is not a valid IPv4 address"
+        if not _HOSTNAME.fullmatch(ip):
+            return f"{ip!r} is neither an IP address nor a hostname"
+    # Cloudflare serves TLS on its HTTPS ports only, and plain HTTP on its HTTP
+    # ports only. A config on the other family cannot connect -- and when
+    # configs.txt is read back in as a source, rule 4, 7 or 8 drops it.
+    if security == "tls" and port not in PORTS_MAPPED_TO_443:
+        return (
+            f"port {port!r} is not one of Cloudflare's HTTPS ports"
+            f" ({', '.join(PORTS_MAPPED_TO_443)}), which a TLS config needs"
+        )
+    if security == "none" and port not in PORTS_MAPPED_TO_8080:
+        return (
+            f"port {port!r} is not one of Cloudflare's HTTP ports"
+            f" ({', '.join(PORTS_MAPPED_TO_8080)}), which a security=none config needs"
+        )
+    return None
+
+
+def endpoint_text(ip: str, port: str) -> str:
+    """ip:port as a link writes it, IPv6 bracketed, so it reads unambiguously."""
+    return f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
+
+
 def _decode_variants(entries: object) -> list[Variant]:
     """VARIANTS_ENCODED, decoded. An entry of the wrong shape is refused with a
     message about it, rather than as a TypeError out of the NamedTuple."""
     if not isinstance(entries, (list, tuple)):
         raise AssertionError(
-            "VARIANTS_ENCODED must be a list of (fm, dialMode, ech, echOutbound, fp, cs)"
-            f" entries, not {type(entries).__name__}"
+            "VARIANTS_ENCODED must be a list of (ip, port, fm, dialMode, security,"
+            f" ech, echOutbound, fp, cs) entries, not {type(entries).__name__}"
         )
     decoded: list[Variant] = []
     for index, entry in enumerate(entries):
@@ -311,10 +404,13 @@ def _decode_variants(entries: object) -> list[Variant]:
             or not all(isinstance(value, str) for value in entry)
         ):
             raise AssertionError(
-                f"VARIANTS_ENCODED[{index}] is not an (fm, dialMode, ech, echOutbound, fp, cs)"
-                f" entry of six strings: {entry!r}"
+                f"VARIANTS_ENCODED[{index}] is not an (ip, port, fm, dialMode, security,"
+                f" ech, echOutbound, fp, cs) entry of nine strings: {entry!r}"
             )
-        decoded.append(Variant(*(unquote(value) for value in entry)))
+        # ip and port are the link's address, used as written; the rest are
+        # query parameters, stored percent-encoded and decoded here.
+        ip, port, *rest = entry
+        decoded.append(Variant(ip, port, *(unquote(value) for value in rest)))
     return decoded
 
 
@@ -339,7 +435,7 @@ NAME_PREFIX = ""
 def _self_check() -> None:
     """Fail loudly at import if a tunable above is unusable, rather than
     silently corrupting configs.txt."""
-    # A variant is one entry of six fields, so they can never drift out of
+    # A variant is one entry of nine fields, so they can never drift out of
     # step -- but the list itself, and the shape of each entry, are still worth
     # checking here rather than as an IndexError deep inside finalise.
     _decode_variants(VARIANTS_ENCODED)
@@ -347,10 +443,25 @@ def _self_check() -> None:
         raise AssertionError("VARIANTS is empty: there would be nothing to publish")
 
     for index, (variant, encoded) in enumerate(zip(VARIANTS, VARIANTS_ENCODED)):
-        for key, value, raw in zip(VARIANT_KEYS, variant, encoded):
+        if variant.security not in SECURITY_VALUES:
+            raise AssertionError(
+                f"VARIANTS[{index}].security is {variant.security!r}; it has to be"
+                f" one of {', '.join(SECURITY_VALUES)}"
+            )
+        problem = endpoint_problem(variant.ip, variant.port, variant.security)
+        if problem:
+            raise AssertionError(f"VARIANTS[{index}]: {problem}")
+        if variant.security == "none":
+            carried = [field for field in TLS_ONLY_FIELDS if getattr(variant, field)]
+            if carried:
+                raise AssertionError(
+                    f"VARIANTS[{index}] is security=none but sets {', '.join(carried)},"
+                    " which only exist inside TLS"
+                )
+        for field, value, raw in zip(Variant._fields[2:], variant[2:], encoded[2:]):
             if quote(value, safe="") != raw:
                 raise AssertionError(
-                    f"VARIANTS[{index}].{key} does not round-trip through percent-encoding"
+                    f"VARIANTS[{index}].{field} does not round-trip through percent-encoding"
                 )
         # fm is retyped by hand whenever a fragment is tuned, and it is never
         # exercised by the health check -- nodes are tested without it. Left
@@ -387,18 +498,11 @@ def _self_check() -> None:
     if len(set(VARIANTS)) != len(VARIANTS):
         raise AssertionError("VARIANTS repeats an entry, which would publish duplicate configs")
 
-    for name, port in (
-        ("HEALTHCHECK_PORT", HEALTHCHECK_PORT),
-        ("OUTPUT_PORT", OUTPUT_PORT),
-    ):
-        if not (str(port).isdigit() and 1 <= int(port) <= 65535):
-            raise AssertionError(f"{name} is not a port number: {port!r}")
-    for name, address in (
-        ("HEALTHCHECK_ADDRESS", HEALTHCHECK_ADDRESS),
-        ("OUTPUT_ADDRESS", OUTPUT_ADDRESS),
-    ):
-        if not str(address).strip():
-            raise AssertionError(f"{name} is empty")
+    # The tested endpoint is held to the same rules: the check is TLS too, and
+    # a check that cannot connect fails every node.
+    problem = endpoint_problem(str(HEALTHCHECK_ADDRESS), str(HEALTHCHECK_PORT), "tls")
+    if problem:
+        raise AssertionError(f"HEALTHCHECK_ADDRESS/HEALTHCHECK_PORT: {problem}")
 
 
 _self_check()
@@ -482,15 +586,16 @@ def rule_10_point_at_healthcheck(node: Node) -> None:
     node.port = str(HEALTHCHECK_PORT)
 
 
-def rule_10_point_at_output(node: Node) -> None:
-    """Send the node through the endpoint the subscription publishes.
+def rule_10_point_at_output(node: Node, variant: int = 0) -> None:
+    """Send the node through one variant's published endpoint.
 
     Separate from the health-check endpoint on purpose: the check proves the
     node answers behind Cloudflare, which stays true whichever Cloudflare
-    address the published link happens to name.
+    address a published link names -- so a node tested once can be published
+    on as many addresses as there are variants.
     """
-    node.address = str(OUTPUT_ADDRESS)
-    node.port = str(OUTPUT_PORT)
+    node.address = VARIANTS[variant].ip
+    node.port = VARIANTS[variant].port
 
 
 # --- rule 11: strip certificate opt-outs --------------------------------
@@ -508,7 +613,7 @@ def rule_11_strip_insecure(node: Node) -> None:
             del node.params[key]
 
 
-# --- deferred parameters: fm and dialMode ---------------------------------
+# --- deferred parameters ---------------------------------------------------
 
 
 def strip_deferred_params(node: Node) -> None:
@@ -517,8 +622,8 @@ def strip_deferred_params(node: Node) -> None:
 
     The health check has to run on nodes carrying none of them, so that what it
     measures is the node rather than one source's idea of how to fragment,
-    dial, hide the SNI, or shape the ClientHello. :func:`apply_deferred_params` puts this project's
-    values on afterwards.
+    dial, hide the SNI, or shape the ClientHello. :func:`apply_deferred_params`
+    puts this project's values on afterwards.
     """
     for key in list(node.params):
         if key.lower() in DEFERRED_KEYS:
@@ -531,6 +636,7 @@ def apply_deferred_params(node: Node, variant: int = 0) -> None:
 
     ``variant`` indexes :data:`VARIANTS`, so the six always travel as the
     entry they were written as, each under the exact key in VARIANT_KEYS.
+    The variant's ip and port are rule 10's -- see rule_10_point_at_output.
 
     An empty field means "publish without it": nothing is written. For dialMode
     that is not a compromise -- the core treats an absent dialMode and
@@ -538,9 +644,23 @@ def apply_deferred_params(node: Node, variant: int = 0) -> None:
     guaranteed the node is not carrying a stale value from its source, so an
     empty field really does publish the default.
     """
-    for key, value in zip(VARIANT_KEYS, VARIANTS[variant]):
+    for key, value in VARIANTS[variant].params.items():
         if value:
             node.set(key, value)
+
+
+def set_published_security(node: Node, variant: int = 0) -> None:
+    """Give a published copy its variant's security.
+
+    Every node is tested over TLS; this only decides what is published. A
+    security=none copy also loses its sni and alpn -- TLS extensions, set on
+    every node before the check, that mean nothing on a plaintext link.
+    """
+    security = VARIANTS[variant].security
+    node.set("security", security)
+    if security == "none":
+        for key in TLS_ONLY_KEYS:
+            node.pop(key)
 
 
 # --- SNI -------------------------------------------------------------------
@@ -752,12 +872,17 @@ def finalise(nodes: list[Node], stats: dict | None = None) -> list[Node]:
             copy = node.copy()
             copy.latency_ms = node.latency_ms   # Node.copy does not carry this
             apply_deferred_params(copy, variant)
-            rule_10_point_at_output(copy)
+            set_published_security(copy, variant)
+            rule_10_point_at_output(copy, variant)
             if RENAME_NODES and len(VARIANTS) > 1:
-                copy.tag = make_tag(copy, variant)
+                # Named from the node as tested, not from the copy: then no
+                # field of a variant -- its address, its security, anything it
+                # adds -- can rename what is published. Only the index can.
+                copy.tag = make_tag(node, variant)
             published.append(copy)
     counts["published"] = len(published)
     counts["published_variants"] = len(VARIANTS)
+    counts["published_without_tls"] = sum(1 for node in published if node.security == "none")
     for key in VARIANT_KEYS:
         counts[f"published_with_{key}"] = sum(1 for node in published if node.has(key))
     return published

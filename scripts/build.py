@@ -262,6 +262,11 @@ def render(links: list[str], counts: dict, sources: list[str]) -> str:
         header.append(
             f"# {listed} applied after testing, to nodes that had already passed"
         )
+    if counts.get("published_without_tls"):
+        header.append(
+            f"# {counts['published_without_tls']} configs published without TLS;"
+            " every node was tested over TLS only"
+        )
     if "flaky_percent" in counts:
         header.append(
             f"# {counts['flaky_percent']}% of nodes that worked at least once"
@@ -394,10 +399,14 @@ def main() -> int:
     # the published list can grow past the number of nodes tested.
     published = transform.finalise(healthy, counts)
     variants = counts.get("published_variants", 1)
+    endpoints = list(dict.fromkeys(
+        transform.endpoint_text(v.ip, v.port) + ("" if v.security == "tls" else " without TLS")
+        for v in transform.VARIANTS
+    ))
     print(
         f"Finalising {len(healthy)} healthy nodes"
         + (f" x {variants} variants = {len(published)} configs" if variants > 1 else "")
-        + f", publishing on {transform.OUTPUT_ADDRESS}:{transform.OUTPUT_PORT}"
+        + f", publishing on {', '.join(endpoints)}"
     )
 
     links = [node.to_link() for node in published]

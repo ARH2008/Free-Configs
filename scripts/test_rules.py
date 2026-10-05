@@ -170,6 +170,8 @@ check(already.port == "443" and already.get("sni") == "orig.example",
       "rule 9 isolated: a node already on 443 is left alone")
 
 # --- rule 10: endpoints ----------------------------------------------------
+# One fixed endpoint for the health check; the published endpoint is each
+# variant's own ip and port.
 
 for node in one(**BASE):
     check(node.address == transform.HEALTHCHECK_ADDRESS,
@@ -178,10 +180,10 @@ for node in one(**BASE):
           "rule 10: a node about to be tested uses the health-check port")
 
 for node in finalised(**BASE):
-    check(node.address == transform.OUTPUT_ADDRESS,
-          "rule 10: a published node uses the output address")
-    check(node.port == transform.OUTPUT_PORT,
-          "rule 10: a published node uses the output port")
+    check(node.address == transform.VARIANTS[0].ip,
+          "rule 10: a published node uses its variant's ip")
+    check(node.port == transform.VARIANTS[0].port,
+          "rule 10: a published node uses its variant's port")
 
 probe = parse_line(link(**BASE))
 probe.address, probe.port = "0.0.0.0", "1"
@@ -189,32 +191,30 @@ transform.rule_10_point_at_healthcheck(probe)
 check(probe.address == transform.HEALTHCHECK_ADDRESS
       and probe.port == transform.HEALTHCHECK_PORT,
       "rule 10: the setter applies the health-check endpoint")
-transform.rule_10_point_at_output(probe)
-check(probe.address == transform.OUTPUT_ADDRESS and probe.port == transform.OUTPUT_PORT,
-      "rule 10: the setter applies the output endpoint")
+transform.rule_10_point_at_output(probe, 0)
+check((probe.address, probe.port) == (transform.VARIANTS[0].ip, transform.VARIANTS[0].port),
+      "rule 10: the setter applies a variant's endpoint")
 
-# The two endpoints are genuinely independent. Patched rather than assumed:
-# they hold the same values today, so an equality test would still pass if one
-# phase were wired to the other phase's constants.
-real_endpoints = (
-    transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT,
-    transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT,
-)
+# The tested and published endpoints are genuinely independent. Patched rather
+# than assumed: they hold the same values today, so an equality test would
+# still pass if one phase were wired to the other's.
+real_endpoint = (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT)
+real_variants_rule10 = transform.VARIANTS
 try:
     transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT = "10.0.0.1", "8443"
-    transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT = "10.0.0.2", "2053"
+    transform.VARIANTS = [real_variants_rule10[0]._replace(ip="10.0.0.2", port="2053")]
     tested = one(**BASE)
     check([(n.address, n.port) for n in tested] == [("10.0.0.1", "8443")],
           "rule 10: the tested endpoint comes from the health-check constants")
     published = transform.finalise(tested, {})
     check([(n.address, n.port) for n in published] == [("10.0.0.2", "2053")],
-          "rule 10: the published endpoint comes from the output constants")
+          "rule 10: the published endpoint comes from the variant")
     check(published[0].to_link().startswith("vless://")
           and "@10.0.0.2:2053?" in published[0].to_link(),
-          "rule 10: the output address and port reach the emitted link")
+          "rule 10: the variant's ip and port reach the emitted link")
 finally:
-    (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT,
-     transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT) = real_endpoints
+    transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT = real_endpoint
+    transform.VARIANTS = real_variants_rule10
 
 # --- rule 11: strip certificate opt-outs -----------------------------------
 
@@ -303,7 +303,10 @@ check(all(n.port == transform.HEALTHCHECK_PORT and n.security == "tls" for n in 
 # tested, and the default variant puts all three on what is published.
 
 DEFAULT = transform.VARIANTS[0]
-DEFAULT_ENCODED = transform.VARIANTS_ENCODED[0]
+# By field name, never by position: an index silently means a different field
+# the moment one is added, and "fm" at index 0 would become the ip -- which is
+# in every link, so a check on it would keep passing for the wrong reason.
+DEFAULT_ENCODED = dict(zip(transform.Variant._fields, transform.VARIANTS_ENCODED[0]))
 
 for node in one(**BASE):
     check(not node.has("fp") and not node.has("cs") and not node.has("fm"),
@@ -315,8 +318,8 @@ for node in finalised(**BASE):
     check(node.get("cs") == DEFAULT.cs, "rule 12: cs value on a published node")
     check(node.get("fm") == DEFAULT.fm, "rule 12: fm value on a published node")
     emitted = node.to_link()
-    check(DEFAULT_ENCODED[0] in emitted, "rule 12: fm is byte-exact in the published link")
-    check(DEFAULT_ENCODED[5] in emitted, "rule 12: cs is byte-exact in the published link")
+    check(DEFAULT_ENCODED["fm"] in emitted, "rule 12: fm is byte-exact in the published link")
+    check(DEFAULT_ENCODED["cs"] in emitted, "rule 12: cs is byte-exact in the published link")
     check("fp=unsafe" in emitted, "rule 12: fp is byte-exact in the published link")
 
 # A converted plaintext node gets the same masking as any other.
@@ -423,16 +426,30 @@ twins = transform.transform(
 check(len(twins) == 1, "upgrade alpn: ws nodes differing only in source alpn deduplicate")
 
 # --- published variants ----------------------------------------------------
-# Every healthy node is published once per (fm, dialMode, ech, echOutbound,
-# fp, cs) entry, its variants adjacent, so N survivors and I variants make
-# N * I configs in one file.
+# Every healthy node is published once per variant -- (ip, port, fm, dialMode,
+# security, ech, echOutbound, fp, cs) -- its variants adjacent, so N survivors
+# and I variants make N * I configs in one file.
 
 
-def set_variants(*entries: tuple[str, str, str, str, str, str]) -> None:
+def entry(**fields: str) -> tuple:
+    """A variant entry by field name, in transform.Variant's order. Anything
+    not given takes the default endpoint, security=tls and an empty value, so
+    each case says only what it is about -- and none breaks when a field is
+    added."""
+    values = {field: "" for field in transform.Variant._fields}
+    values.update(ip="188.114.97.6", port="443", security="tls")
+    unknown = set(fields) - set(values)
+    assert not unknown, f"not Variant fields: {unknown}"
+    values.update(fields)
+    return tuple(values[field] for field in transform.Variant._fields)
+
+
+def set_variants(*entries: tuple) -> None:
     """Patch VARIANTS and VARIANTS_ENCODED together, so _self_check still has
-    a consistent pair of lists to look at."""
+    a consistent pair of lists to look at. ip and port are written plainly,
+    the rest percent-encoded, as in transform.py."""
     transform.VARIANTS_ENCODED = [
-        tuple(quote(value, safe="") for value in entry) for entry in entries
+        (ip, port, *(quote(value, safe="") for value in rest)) for ip, port, *rest in entries
     ]
     transform.VARIANTS = [transform.Variant(*entry) for entry in entries]
 
@@ -452,12 +469,16 @@ real_variants = transform.VARIANTS
 real_variants_encoded = transform.VARIANTS_ENCODED
 try:
     # Every field varies independently across the three, so a field wired to
-    # the wrong index cannot line up with the right value by accident.
-    V1 = ('{"tcp": []}', "", "", "", "unsafe", "TLS_AES_256_GCM_SHA384")
-    V2 = ('{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello"}}]}',
-          "code-1", ECH_DNS, ECH_OUT, "chrome",
-          "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256")
-    V3 = ("", "code-2", "AEX+DQBBAA==", "", "", "")
+    # the wrong place cannot line up with the right value by accident: three
+    # endpoints (IPv4, an alternate Cloudflare port, IPv6), and the third
+    # published without TLS.
+    V1 = entry(fm='{"tcp": []}', fp="unsafe", cs="TLS_AES_256_GCM_SHA384")
+    V2 = entry(ip="104.16.0.1", port="2053",
+               fm='{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello"}}]}',
+               dial_mode="code-1", ech=ECH_DNS, ech_outbound=ECH_OUT, fp="chrome",
+               cs="TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256")
+    V3 = entry(ip="2606:4700::1", port="8080", dial_mode="code-2", security="none")
+    VARIANTS3 = [transform.Variant(*v) for v in (V1, V2, V3)]
     set_variants(V1, V2, V3)
 
     pool = survivors(4)
@@ -466,27 +487,40 @@ try:
     check([n.host for n in published]
           == [f"h{i}.example" for i in range(4) for _ in range(3)],
           "variants: a node's variants are adjacent and the node order is kept")
-    for position, key in enumerate(transform.VARIANT_KEYS):
-        check([n.get(key) for n in published] == [V1[position], V2[position], V3[position]] * 4,
+    for field, key in zip(transform.PARAM_FIELDS, transform.VARIANT_KEYS):
+        check([n.get(key) for n in published] == [getattr(v, field) for v in VARIANTS3] * 4,
               f"variants: {key} is taken from its own variant, in list order")
-    check(all(not n.has(key) for n in published[2::3] for key in ("fm", "fp", "cs")),
-          "variants: empty fm, fp and cs fields publish nothing")
+    check([n.security for n in published] == ["tls", "tls", "none"] * 4,
+          "variants: security is taken from its own variant, in list order")
+    check([(n.address, n.port) for n in published] == [(v.ip, v.port) for v in VARIANTS3] * 4,
+          "variants: each variant of a node is published on its own ip and port")
+    check(all(not n.has(key) for n in published[2::3]
+              for key in ("fm", "ech", "echOutbound", "fp", "cs")),
+          "variants: empty parameter fields publish nothing")
     check(all(not n.has(key) for n in published[0::3] for key in ("dialMode", "ech", "echOutbound")),
           "variants: empty dialMode, ech and echOutbound fields publish nothing")
 
-    # Variants of one node are the same node: only the deferred fields differ.
-    def without_deferred(node: Node) -> dict:
-        return {
-            k.lower(): v
-            for k, v in node.params.items()
-            if k.lower() not in transform.DEFERRED_KEYS
-        }
+    # A plaintext copy drops what only exists inside TLS; a TLS copy keeps it.
+    check(all(not n.has("sni") and not n.has("alpn") for n in published[2::3]),
+          "variants: a security=none copy publishes no sni and no alpn")
+    check(all(n.get("sni") == n.host and n.get("alpn") == "http/1.1"
+              for i, n in enumerate(published) if i % 3 != 2),
+          "variants: a TLS copy keeps sni=host and the http/1.1 alpn")
+    plain_stream = published[2].to_outbound("t")["streamSettings"]
+    check(plain_stream["security"] == "none" and "tlsSettings" not in plain_stream,
+          "variants: a security=none copy renders a plaintext outbound")
+    check("security=none" in published[2].to_link(), "variants: and says so in its link")
+
+    # Variants of one node are the same node: only what a variant sets differs.
+    def not_set_by_variant(node: Node) -> dict:
+        set_by_variant = set(transform.DEFERRED_KEYS) | {"security"} | set(transform.TLS_ONLY_KEYS)
+        return {k.lower(): v for k, v in node.params.items() if k.lower() not in set_by_variant}
 
     trio = published[:3]
-    check(without_deferred(trio[0]) == without_deferred(trio[1]) == without_deferred(trio[2]),
-          "variants: variants of one node differ in nothing but the four deferred fields")
-    check(len({(n.scheme, n.uid, n.address, n.port) for n in trio}) == 1,
-          "variants: variants of one node share its identity and endpoint")
+    check(not_set_by_variant(trio[0]) == not_set_by_variant(trio[1]) == not_set_by_variant(trio[2]),
+          "variants: variants of one node differ in nothing but what the variant sets")
+    check(len({(n.scheme, n.uid, n.host) for n in trio}) == 1,
+          "variants: variants of one node share its identity")
     check(len({n.tag for n in published}) == 12,
           "variants: every published config gets a name of its own")
 
@@ -510,8 +544,8 @@ try:
     # nothing sensible to mutate in place.
     check(all(not n.has(key) for n in pool for key in transform.VARIANT_KEYS),
           "variants: finalise leaves the nodes it was handed untouched")
-    check(all(n.address == transform.HEALTHCHECK_ADDRESS for n in pool),
-          "variants: finalise does not repoint the nodes it was handed")
+    check(all(n.address == transform.HEALTHCHECK_ADDRESS and n.security == "tls" for n in pool),
+          "variants: finalise neither repoints nor un-TLSes the nodes it was handed")
 
     measured = survivors(1)
     measured[0].latency_ms = 42
@@ -522,8 +556,9 @@ try:
     transform.finalise(survivors(2), stats)
     check(stats["published"] == 6 and stats["published_variants"] == 3,
           "variants: the counts describe the expansion")
-    check([stats[f"published_with_{key}"] for key in transform.VARIANT_KEYS] == [4, 4, 4, 2, 4, 4],
+    check([stats[f"published_with_{key}"] for key in transform.VARIANT_KEYS] == [4, 4, 2, 2, 4, 4],
           "variants: the counts only count configs that really carry each field")
+    check(stats["published_without_tls"] == 2, "variants: plaintext copies are counted")
 
     # A single variant has to behave exactly as the pipeline did before.
     transform.VARIANTS, transform.VARIANTS_ENCODED = real_variants, real_variants_encoded
@@ -534,29 +569,37 @@ try:
           "variants: one variant leaves the published names exactly as they were")
 
     # The self-source round trip has to survive the expansion: re-reading a
-    # published file collapses the variants back to one node each -- they
-    # differ only in what strip_deferred_params removes -- and re-expands to
+    # published file collapses the variants back to one node each -- the
+    # plaintext copy too, which rule 9 turns back into TLS -- and re-expands to
     # the identical file.
-    set_variants(V1, V2)
+    set_variants(V1, V2, V3)
     links = [n.to_link() for n in transform.finalise(survivors(2), {})]
-    check(len(links) == 4, "variants: two variants of two nodes make four links")
-    collapsed = transform.transform([parse_line(line) for line in links], {})
+    check(len(links) == 6, "variants: three variants of two nodes make six links")
+    stats = {}
+    collapsed = transform.transform([parse_line(line) for line in links], stats)
     check(len(collapsed) == 2,
           "variants: re-reading the published file collapses back to the nodes")
+    check(stats.get("converted_to_tls_rule_9") == 2,
+          "variants: the plaintext copies come back through rule 9")
     check(all(not n.has(key) for n in collapsed for key in transform.VARIANT_KEYS),
           "variants: a re-read variant carries none of the six into the next check")
     check([n.to_link() for n in transform.finalise(collapsed, {})] == links,
           "variants: and re-expands to exactly the same file")
 
     # Retuning a variant must not rename what is published: finalise names each
-    # variant from the node and its index, never from the fields it adds, or a
-    # fragment tweak would rewrite every name in configs.txt.
+    # copy from the node as tested and the variant's index, never from what
+    # the variant adds, or a fragment tweak would rewrite every name.
     names_before = [n.tag for n in transform.finalise(survivors(2), {})]
-    set_variants(V1[:5] + ("TLS_AES_128_GCM_SHA256",),
-                 ('{"tcp": [{"type": "fragment"}]}',) + V2[1:4] + ("firefox", "TLS_AES_256_GCM_SHA384"))
+    set_variants(
+        transform.Variant(*V1)._replace(cs="TLS_AES_128_GCM_SHA256", ip="104.16.0.9",
+                                        port="2052", security="none", fp="", fm=""),
+        transform.Variant(*V2)._replace(fm='{"tcp": [{"type": "fragment"}]}', fp="firefox",
+                                        cs="TLS_AES_256_GCM_SHA384", port="2096"),
+        transform.Variant(*V3)._replace(security="tls", port="443", fp="unsafe"),
+    )
     check([n.tag for n in transform.finalise(survivors(2), {})] == names_before,
-          "variants: retuning every field of every variant renames nothing")
-    set_variants(V1, V2)
+          "variants: retuning any field of any variant, security included, renames nothing")
+    set_variants(V1, V2, V3)
 
     # _self_check is where a badly written variant list has to stop -- before
     # anything is fetched, and long before a list whose every config fails at
@@ -564,31 +607,47 @@ try:
     for label, entries, expected in (
         ("an empty list", (), "nothing to publish"),
         ("a repeated entry", (V1, V1), "duplicate"),
-        ("an fm that is not JSON", (("{not json", "", "", "", "", ""),), "not valid JSON"),
+        ("an fm that is not JSON", (entry(fm="{not json"),), "not valid JSON"),
+        # security, and the port family that has to go with it
+        ("an empty security", (entry(security=""),), "has to be one of"),
+        ("security spelled in capitals", (entry(security="TLS"),), "has to be one of"),
+        ("a security the pipeline cannot publish", (entry(security="reality"),), "has to be one of"),
+        ("tls on a Cloudflare HTTP port", (entry(port="8080"),), "HTTPS ports"),
+        ("none on a Cloudflare HTTPS port", (entry(security="none", port="443"),), "HTTP ports"),
+        ("none on a port Cloudflare does not serve", (entry(security="none", port="81"),), "HTTP ports"),
+        ("none with an fp", (entry(security="none", port="8080", fp="chrome"),), "inside TLS"),
+        ("none with a cs", (entry(security="none", port="8080", cs="TLS_AES_128_GCM_SHA256"),),
+         "inside TLS"),
+        ("none with an ech", (entry(security="none", port="8080", ech=ECH_DNS),), "inside TLS"),
+        ("none with an echOutbound",
+         (entry(security="none", port="8080", ech=ECH_DNS, ech_outbound=ECH_OUT),), "inside TLS"),
         # ech, mirroring what the core accepts when it dials
-        ("an ech that is neither base64 nor a query",
-         (("", "", "not base64!", "", "", ""),), "neither a base64"),
-        ("an ech query with an empty name", (("", "", "+https://1.1.1.1/dns-query", "", "", ""),),
-         "needs the name"),
-        ("an ech query to a server the core cannot use", (("", "", "x+tls://1.1.1.1", "", "", ""),),
-         "only fetches"),
+        ("an ech that is neither base64 nor a query", (entry(ech="not base64!"),), "neither a base64"),
+        ("an ech query with an empty name", (entry(ech="+https://1.1.1.1/dns-query"),), "needs the name"),
+        ("an ech query to a server the core cannot use", (entry(ech="x+tls://1.1.1.1"),), "only fetches"),
         # echOutbound, mirroring what PattN and PattNG accept
-        ("an echOutbound without an ech", (("", "", "", ECH_OUT, "", ""),), "needs an ech"),
-        ("an echOutbound that is not JSON", (("", "", ECH_DNS, "{bad", "", ""),), "not valid JSON"),
-        ("an echOutbound that is not an object", (("", "", ECH_DNS, "[1]", "", ""),), "not a JSON object"),
-        ("an echOutbound with no tag", (("", "", ECH_DNS, '{"protocol": "freedom"}', "", ""),), "no tag"),
-        ("an echOutbound tagged direct", (("", "", ECH_DNS, '{"tag": "direct"}', "", ""),), "may not be"),
-        ("an echOutbound tagged block", (("", "", ECH_DNS, '{"tag": "block"}', "", ""),), "may not be"),
-        ("an echOutbound tagged proxy", (("", "", ECH_DNS, '{"tag": "proxy"}', "", ""),), "may not be"),
-        ("an echOutbound tagged proxy-2", (("", "", ECH_DNS, '{"tag": "proxy-2"}', "", ""),), "may not be"),
+        ("an echOutbound without an ech", (entry(ech_outbound=ECH_OUT),), "needs an ech"),
+        ("an echOutbound that is not JSON", (entry(ech=ECH_DNS, ech_outbound="{bad"),), "not valid JSON"),
+        ("an echOutbound that is not an object", (entry(ech=ECH_DNS, ech_outbound="[1]"),),
+         "not a JSON object"),
+        ("an echOutbound with no tag", (entry(ech=ECH_DNS, ech_outbound='{"protocol": "freedom"}'),),
+         "no tag"),
+        ("an echOutbound tagged direct", (entry(ech=ECH_DNS, ech_outbound='{"tag": "direct"}'),),
+         "may not be"),
+        ("an echOutbound tagged block", (entry(ech=ECH_DNS, ech_outbound='{"tag": "block"}'),),
+         "may not be"),
+        ("an echOutbound tagged proxy", (entry(ech=ECH_DNS, ech_outbound='{"tag": "proxy"}'),),
+         "may not be"),
+        ("an echOutbound tagged proxy-2", (entry(ech=ECH_DNS, ech_outbound='{"tag": "proxy-2"}'),),
+         "may not be"),
         ("an echOutbound repeating a key",
-         (("", "", ECH_DNS, '{"tag": "a", "tag": "b"}', "", ""),), "repeated key"),
+         (entry(ech=ECH_DNS, ech_outbound='{"tag": "a", "tag": "b"}'),), "repeated key"),
         # cs, which the core would otherwise trim without a word
         ("a cs naming a suite Go does not know",
-         (("", "", "", "", "", "TLS_AES_128_GCM_SHA256:TLS_NOT_A_SUITE"),), "does not know"),
-        ("a cs that is all typos", (("", "", "", "", "", "TLS_AES_128_GCM"),), "does not know"),
+         (entry(cs="TLS_AES_128_GCM_SHA256:TLS_NOT_A_SUITE"),), "does not know"),
+        ("a cs that is all typos", (entry(cs="TLS_AES_128_GCM"),), "does not know"),
         ("a cs naming a suite twice",
-         (("", "", "", "", "", "TLS_AES_128_GCM_SHA256:TLS_AES_128_GCM_SHA256"),), "twice"),
+         (entry(cs="TLS_AES_128_GCM_SHA256:TLS_AES_128_GCM_SHA256"),), "twice"),
     ):
         set_variants(*entries)
         try:
@@ -600,18 +659,26 @@ try:
     # And accepts what both clients and the core accept, including the forms
     # that look wrong at a glance: base64 carries '+', and the clients' prefix
     # check is case-sensitive.
-    for label, entries in (
-        ("an ech query naming its server", (("", "", ECH_DNS, "", "", ""),)),
-        ("an ech query of the node's own SNI", (("", "", "https://1.1.1.1/dns-query", "", "", ""),)),
-        ("an ech query over udp", (("", "", "ip.gs+udp://8.8.8.8", "", "", ""),)),
-        ("a base64 ech containing +", (("", "", "AEX+DQBBAA==", "", "", ""),)),
-        ("an echOutbound with its ech", (("", "", ECH_DNS, ECH_OUT, "", ""),)),
-        ("an echOutbound tagged Proxy", (("", "", ECH_DNS, '{"tag": "Proxy"}', "", ""),)),
-        ("a cs from Go's insecure list", (("", "", "", "", "", "TLS_RSA_WITH_AES_128_CBC_SHA"),)),
+    accepted_cases = [
+        ("an ech query naming its server", (entry(ech=ECH_DNS),)),
+        ("an ech query of the node's own SNI", (entry(ech="https://1.1.1.1/dns-query"),)),
+        ("an ech query over udp", (entry(ech="ip.gs+udp://8.8.8.8"),)),
+        ("a base64 ech containing +", (entry(ech="AEX+DQBBAA=="),)),
+        ("an echOutbound with its ech", (entry(ech=ECH_DNS, ech_outbound=ECH_OUT),)),
+        ("an echOutbound tagged Proxy", (entry(ech=ECH_DNS, ech_outbound='{"tag": "Proxy"}'),)),
+        ("a cs from Go's insecure list", (entry(cs="TLS_RSA_WITH_AES_128_CBC_SHA"),)),
         # real_variants, not transform.VARIANTS: inside this block the latter is
         # whatever the previous case patched in.
-        ("the default cs", (("", "", "", "", "", real_variants[0].cs),)),
-    ):
+        ("the default cs", (entry(cs=real_variants[0].cs),)),
+        ("none with an fm and a dialMode",
+         (entry(security="none", port="8080", fm='{"tcp": []}', dial_mode="code-1"),)),
+        ("the same node with and without TLS",
+         (entry(), entry(security="none", port="8080"))),
+    ]
+    for port in transform.PORTS_MAPPED_TO_8080:
+        accepted_cases.append((f"none on Cloudflare HTTP port {port}",
+                               (entry(security="none", port=port),)))
+    for label, entries in accepted_cases:
         set_variants(*entries)
         try:
             transform._self_check()
@@ -619,21 +686,176 @@ try:
         except AssertionError as error:
             check(False, f"variants: _self_check accepts {label} ({error})")
 
-    # Entries that are not four strings at all.
+    # Entries that are not nine strings at all -- including every shape the
+    # list has had before, so an old entry pasted back in is refused clearly.
     for label, bad in (
         ("an entry of the old two-field shape", ("{}", "")),
         ("an entry of the old four-field shape", ("{}", "", "", "")),
-        ("an entry with a field that is not a string", ("{}", "", None, "", "", "")),
+        ("an entry of the old six-field shape", ("{}", "", "", "", "unsafe", "")),
+        ("an entry of the old eight-field shape",
+         ("188.114.97.6", "443", "{}", "", "", "", "unsafe", "")),
+        ("an entry with a field that is not a string", entry()[:5] + (None,) + entry()[6:]),
+        ("an entry with a port that is not a string", ("188.114.97.6", 443) + entry()[2:]),
     ):
         transform.VARIANTS_ENCODED = [bad]
         try:
             transform._self_check()
             check(False, f"variants: _self_check rejects {label}")
         except AssertionError as error:
-            check("not an (fm, dialMode, ech, echOutbound, fp, cs) entry" in str(error),
-                  f"variants: _self_check rejects {label}")
+            check("not an (ip, port, fm, dialMode, security, ech, echOutbound, fp, cs) entry"
+                  in str(error), f"variants: _self_check rejects {label}")
 finally:
     transform.VARIANTS, transform.VARIANTS_ENCODED = real_variants, real_variants_encoded
+
+# --- one node on several addresses ------------------------------------------
+# Variants that differ only in ip and port publish every healthy node once per
+# address -- the reason ip and port are variant fields at all.
+
+real_variants_mip = transform.VARIANTS
+real_variants_encoded_mip = transform.VARIANTS_ENCODED
+real_healthcheck_mip = (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT)
+try:
+    DECODED = tuple(getattr(DEFAULT, field) for field in transform.Variant._fields[2:])
+    ENDPOINTS = [
+        ("188.114.97.6", "443"),
+        ("104.16.0.1", "2053"),
+        ("2606:4700::1", "8443"),
+        ("cf.example.net", "2096"),
+    ]
+    set_variants(*[endpoint + DECODED for endpoint in ENDPOINTS])
+
+    pool = survivors(3)
+    tested_endpoints = {(n.address, n.port) for n in pool}
+    check(tested_endpoints == {(transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT)},
+          "endpoints: however many addresses are published, every node is tested on the one")
+
+    published = transform.finalise(pool, {})
+    check(len(published) == 3 * len(ENDPOINTS),
+          "endpoints: N healthy nodes x I addresses = N*I published configs")
+    check([(n.address, n.port) for n in published] == ENDPOINTS * 3,
+          "endpoints: each node is published on every address, in the order listed")
+    check(len({n.to_link() for n in published}) == len(published),
+          "endpoints: no two published configs are the same link")
+    check(len({n.tag for n in published}) == len(published),
+          "endpoints: every address of a node gets a name of its own")
+
+    # Within one node, the address is the only thing that differs.
+    first = published[:len(ENDPOINTS)]
+    check(len({tuple(sorted(n.params.items())) for n in first}) == 1,
+          "endpoints: one node's copies carry identical parameters")
+    check(all(n.get(key) == value for n in first for key, value in DEFAULT.params.items() if value),
+          "endpoints: and those are the variant's own parameters")
+
+    # IPv6 is bracketed in the link, bare everywhere else; a hostname is as written.
+    v6 = published[2]
+    check("@[2606:4700::1]:8443?" in v6.to_link(),
+          "endpoints: an IPv6 address is bracketed in the published link")
+    check(parse_line(v6.to_link()).address == "2606:4700::1",
+          "endpoints: and parses back to the bare address")
+    check(v6.to_outbound("t")["settings"]["vnext"][0]["address"] == "2606:4700::1",
+          "endpoints: the outbound gets the bare IPv6 address")
+    check("@cf.example.net:2096?" in published[3].to_link(),
+          "endpoints: a hostname is published as written")
+    check([transform.endpoint_text(ip, port) for ip, port in ENDPOINTS]
+          == ["188.114.97.6:443", "104.16.0.1:2053", "[2606:4700::1]:8443", "cf.example.net:2096"],
+          "endpoints: logs and labels write an IPv6 endpoint bracketed, as links do")
+
+    # configs.txt is a source. Copies of one node on four addresses must come
+    # back as one node -- tested once, on the health-check endpoint -- and go
+    # out again as exactly the same four links.
+    links = [n.to_link() for n in published]
+    collapsed = transform.transform([parse_line(line) for line in links], {})
+    check(len(collapsed) == 3,
+          "endpoints: re-reading the published file collapses each node's addresses into one")
+    check({(n.address, n.port) for n in collapsed}
+          == {(transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT)},
+          "endpoints: and re-tests them on the health-check endpoint, not a published one")
+    check([n.to_link() for n in transform.finalise(collapsed, {})] == links,
+          "endpoints: and re-expands to exactly the same links")
+
+    # What _self_check refuses, and what it lets through.
+    for label, endpoint, expected in (
+        ("an empty ip", ("", "443"), "empty"),
+        ("an ip with a space around it", (" 188.114.97.6", "443"), "spaces"),
+        ("a mistyped IPv4 address", ("188.114.976", "443"), "not a valid IPv4 address"),
+        ("a bracketed IPv6 address", ("[2606:4700::1]", "443"), "without brackets"),
+        ("an ip that is no address at all", ("bad_host!", "443"), "neither an IP address"),
+        ("a Cloudflare plaintext port", ("188.114.97.6", "8080"), "HTTPS ports"),
+        ("an arbitrary port", ("188.114.97.6", "444"), "HTTPS ports"),
+        ("a port that is not a number", ("188.114.97.6", "https"), "HTTPS ports"),
+        ("an empty port", ("188.114.97.6", ""), "HTTPS ports"),
+    ):
+        set_variants(endpoint + DECODED)
+        try:
+            transform._self_check()
+            check(False, f"endpoints: _self_check rejects {label}")
+        except AssertionError as error:
+            check(expected in str(error), f"endpoints: _self_check rejects {label}")
+
+    for port in transform.PORTS_MAPPED_TO_443:
+        set_variants(("188.114.97.6", port) + DECODED)
+        try:
+            transform._self_check()
+            check(True, f"endpoints: _self_check accepts Cloudflare HTTPS port {port}")
+        except AssertionError as error:
+            check(False, f"endpoints: _self_check accepts Cloudflare HTTPS port {port} ({error})")
+
+    # The same address twice publishes the same link twice; two addresses with
+    # the same parameters are exactly what this feature is for.
+    set_variants(ENDPOINTS[0] + DECODED, ENDPOINTS[0] + DECODED)
+    try:
+        transform._self_check()
+        check(False, "endpoints: _self_check rejects the same address listed twice")
+    except AssertionError as error:
+        check("duplicate" in str(error), "endpoints: _self_check rejects the same address listed twice")
+    set_variants(*[endpoint + DECODED for endpoint in ENDPOINTS])
+    try:
+        transform._self_check()
+        check(True, "endpoints: _self_check accepts one parameter set on four addresses")
+    except AssertionError as error:
+        check(False, f"endpoints: _self_check accepts one parameter set on four addresses ({error})")
+
+    # The health-check endpoint is held to the same rules.
+    set_variants(ENDPOINTS[0] + DECODED)
+    transform.HEALTHCHECK_PORT = "8080"
+    try:
+        transform._self_check()
+        check(False, "endpoints: _self_check rejects a health-check port TLS cannot use")
+    except AssertionError as error:
+        check("HEALTHCHECK" in str(error),
+              "endpoints: _self_check rejects a health-check port TLS cannot use")
+finally:
+    transform.VARIANTS, transform.VARIANTS_ENCODED = real_variants_mip, real_variants_encoded_mip
+    transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT = real_healthcheck_mip
+
+# --- names are pinned across versions --------------------------------------
+# Every check above compares names computed by the same code, so a change to
+# how names are made -- what the hash covers, its format -- would pass them all
+# while renaming every config in configs.txt on the next run. These pin today's
+# names. If one fails on purpose, the next published list is a full rename.
+GOLDEN_LINK = ("vless://11111111-1111-1111-1111-111111111111@1.2.3.4:443"
+               "?security=tls&type=ws&host=a.example&path=%2F#name")
+golden = transform.transform([parse_line(GOLDEN_LINK)], {})[0]
+check(golden.tag == "name | 122798",
+      "naming: a node's published name is the one earlier versions gave it")
+real_variants_golden = transform.VARIANTS
+try:
+    transform.VARIANTS = real_variants_golden + [real_variants_golden[0]._replace(ip="104.16.0.1")]
+    check(transform.finalise([golden], {})[1].tag == "name | 917341",
+          "naming: a second variant's name is the one earlier versions gave it")
+finally:
+    transform.VARIANTS = real_variants_golden
+
+# --- the published header -------------------------------------------------
+# Plaintext configs are a claim the health check never tested -- every node is
+# checked over TLS -- so the file has to say so, and say nothing when there
+# are none.
+header_with = build.render(["vless://x"], {"final_total": 1, "published_without_tls": 3}, ["s"])
+header_without = build.render(["vless://x"], {"final_total": 1, "published_without_tls": 0}, ["s"])
+check("# 3 configs published without TLS; every node was tested over TLS only" in header_with,
+      "header: plaintext configs are declared in the published file")
+check("without TLS" not in header_without,
+      "header: and nothing is said when every config is TLS")
 
 # --- naming ----------------------------------------------------------------
 # A published name carries a short content hash so a client can tell two nodes
@@ -660,9 +882,9 @@ baseline_name = _name_under()
 check(baseline_name.startswith("name | "),
       "naming: the source comment leads the published name")
 for label, overrides in (
-    ("the output address", dict(OUTPUT_ADDRESS="10.9.8.7")),
+    ("a variant's ip", dict(VARIANTS=[transform.VARIANTS[0]._replace(ip="10.9.8.7")])),
     ("the health-check address", dict(HEALTHCHECK_ADDRESS="10.9.8.7")),
-    ("the output port", dict(OUTPUT_PORT="8443")),
+    ("a variant's port", dict(VARIANTS=[transform.VARIANTS[0]._replace(port="8443")])),
     ("fm and dialMode", dict(VARIANTS=[transform.VARIANTS[0]._replace(fm="{}", dial_mode="code-1")])),
     ("fp and cs", dict(VARIANTS=[transform.VARIANTS[0]._replace(
         fp="chrome", cs="TLS_AES_128_GCM_SHA256")])),
@@ -807,9 +1029,9 @@ try:
     check(vm_out[0].address == transform.HEALTHCHECK_ADDRESS,
           "vmess: rule 10 points a vmess node at the health-check address too")
     vm443 = transform.finalise(vm_out, {})[0]
-    check(vm443.address == transform.OUTPUT_ADDRESS and vm443.security == "tls",
+    check(vm443.address == transform.VARIANTS[0].ip and vm443.security == "tls",
           "vmess: rules 8 and 10 apply to a vmess node")
-    check(vm443.port == transform.OUTPUT_PORT,
+    check(vm443.port == transform.VARIANTS[0].port,
           "vmess: a vmess node ends up on the output port like any other")
     check(vm443.get("fm") == transform.VARIANTS[0].fm and vm443.get("cs") == transform.VARIANTS[0].cs,
           "vmess: the pipeline sets fm and cs on the node")
@@ -822,23 +1044,27 @@ try:
     ).decode("utf-8", "replace"))
     check("fm" not in payload and "cs" not in payload,
           "vmess: the wire format has nowhere to carry fm or cs")
-    check(transform.VARIANTS_ENCODED[0][0] not in vm443.to_link(),
+    check(DEFAULT_ENCODED["fm"] not in vm443.to_link(),
           "vmess: fm really is absent from the emitted link")
     check(payload["tls"] == "tls" and payload["sni"] == "vm.example",
           "vmess: what the format can carry is still carried")
-    check(payload["add"] == transform.OUTPUT_ADDRESS
-          and payload["port"] == transform.OUTPUT_PORT,
+    check(payload["add"] == transform.VARIANTS[0].ip
+          and payload["port"] == transform.VARIANTS[0].port,
           "vmess: the rewritten address and port reach the wire format")
 finally:
     transform.INCLUDE_VMESS = real_include
 
 # --- masking constants round trip ------------------------------------------
 
-constant_pairs = [
-]
+# Every percent-encoded field of every variant, by name: ip and port are
+# written plainly and so are not part of this; security is.
+constant_pairs = []
 for _i, (_v, _e) in enumerate(zip(transform.VARIANTS, transform.VARIANTS_ENCODED)):
-    constant_pairs.append((f"VARIANTS[{_i}].fm", _e[0], _v.fm))
-    constant_pairs.append((f"VARIANTS[{_i}].dial_mode", _e[1], _v.dial_mode))
+    _encoded = dict(zip(transform.Variant._fields, _e))
+    for _field in transform.Variant._fields[2:]:
+        constant_pairs.append((f"VARIANTS[{_i}].{_field}", _encoded[_field], getattr(_v, _field)))
+check(len(constant_pairs) == (len(transform.Variant._fields) - 2) * len(transform.VARIANTS),
+      "constants: every encoded field of every variant is round-tripped")
 for name, encoded, decoded in constant_pairs:
     check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
 
@@ -1211,7 +1437,7 @@ check(published_probe.get("fp") == transform.VARIANTS[0].fp
       and published_probe.get("cs") == transform.VARIANTS[0].cs,
       "healthcheck: the published probe keeps fp and cs as well")
 check((published_probe.address, published_probe.port)
-      == (transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT),
+      == (transform.VARIANTS[0].ip, transform.VARIANTS[0].port),
       "healthcheck: the published probe uses the real output endpoint")
 
 check(tested_probe.security == "tls" and published_probe.security == "tls",
@@ -1252,12 +1478,14 @@ finally:
 real_variants = transform.VARIANTS
 try:
     transform.VARIANTS = [
-        transform.Variant('{"tcp": []}', "", "", "", "unsafe", "TLS_AES_256_GCM_SHA384"),
-        transform.Variant('{"tcp": [{"type": "fragment", "settings": {}}]}', "code-1",
-                          "x+https://1.1.1.1/dns-query",
-                          '{"tag": "ech-out", "protocol": "freedom"}',
-                          "chrome", "TLS_AES_128_GCM_SHA256"),
-        transform.Variant("", "code-2", "AEX+DQBBAA==", "", "", ""),
+        transform.Variant(*entry(fm='{"tcp": []}', fp="unsafe", cs="TLS_AES_256_GCM_SHA384")),
+        transform.Variant(*entry(ip="104.16.0.1", port="2053",
+                                 fm='{"tcp": [{"type": "fragment", "settings": {}}]}',
+                                 dial_mode="code-1", ech="x+https://1.1.1.1/dns-query",
+                                 ech_outbound='{"tag": "ech-out", "protocol": "freedom"}',
+                                 fp="chrome", cs="TLS_AES_128_GCM_SHA256")),
+        transform.Variant(*entry(ip="2606:4700::1", port="8080", dial_mode="code-2",
+                                 security="none")),
     ]
     many = healthcheck.preflight_probes()
     check(len(many) == 4,
@@ -1281,10 +1509,26 @@ try:
     check([(node.get("fp"), node.get("cs")) for _, node in many[1:]]
           == [(variant.fp, variant.cs) for variant in transform.VARIANTS],
           "healthcheck: each published probe carries its own variant's fp and cs")
+    check([(node.address, node.port) for _, node in many[1:]]
+          == [(variant.ip, variant.port) for variant in transform.VARIANTS],
+          "healthcheck: each published probe points at its own variant's endpoint")
+    check((many[0][1].address, many[0][1].port)
+          == (transform.HEALTHCHECK_ADDRESS, transform.HEALTHCHECK_PORT),
+          "healthcheck: the tested probe stays on the one health-check endpoint")
+    check("104.16.0.1:2053" in many[2][0],
+          "healthcheck: a probe's description names its endpoint")
     check("ech" in many[2][0] and "echOutbound" in many[2][0] and "echOutbound" not in many[3][0],
           "healthcheck: a probe's description says which of the six it carries")
     check("fp chrome" in many[2][0] and "fp" not in many[3][0],
           "healthcheck: a probe's description names its fingerprint")
+    check(many[3][1].get("security") == "none"
+          and not any(many[3][1].has(key) for key in transform.TLS_ONLY_KEYS),
+          "healthcheck: a security=none variant is probed as plaintext, without sni or alpn")
+    check(many[1][1].get("security") == "tls" and many[1][1].get("sni") == "example.com",
+          "healthcheck: a tls variant is probed over TLS, with its sni")
+    plain_config = healthcheck._preflight_config(many[3][1])
+    check(plain_config["outbounds"][1]["streamSettings"]["security"] == "none",
+          "healthcheck: and the config the core validates for it is plaintext")
 finally:
     transform.VARIANTS = real_variants
 
@@ -1645,13 +1889,13 @@ check(completed.returncode == 0 and len(emitted) == 1,
 published = parse_line(emitted[0])
 check(published.get("fm") == transform.VARIANTS[0].fm,
       "finalise: build.py adds fm to what it publishes")
-check(transform.VARIANTS_ENCODED[0][0] in emitted[0],
+check(DEFAULT_ENCODED["fm"] in emitted[0],
       "finalise: the published fm is byte-exact in configs.txt")
 check(published.get("fp") == transform.VARIANTS[0].fp
       and published.get("cs") == transform.VARIANTS[0].cs,
       "finalise: build.py keeps the masking the health check ran with")
 check((published.address, published.port)
-      == (transform.OUTPUT_ADDRESS, transform.OUTPUT_PORT),
+      == (transform.VARIANTS[0].ip, transform.VARIANTS[0].port),
       "finalise: build.py publishes on the output endpoint")
 
 # A URL with no scheme is the likeliest typo in a hand-edited sources.txt.
