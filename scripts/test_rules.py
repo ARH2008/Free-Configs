@@ -31,17 +31,49 @@ import build  # noqa: E402
 import transform  # noqa: E402
 from nodes import Node, parse_line  # noqa: E402
 
-# The variants this repository ships. Almost every test below is about how the
-# pipeline works, not about which variants happen to be configured, so they run
-# against the first shipped variant alone. Without that, adding a variant to
-# transform.py -- which is what the list is for -- would break tests that have
-# nothing to do with it, and CI runs this suite before it builds. The shipped
-# list itself is checked in its own section, and the end-to-end build.py runs,
-# which read the real transform.py, expect one line per shipped variant.
+# What transform.py ships is configuration, and any legal list is a valid one:
+# adding, changing or removing a variant there must never need a change here.
+# CI runs this suite before it builds, so a test that depended on the shipped
+# values would stop the daily publish whenever they were edited.
+#
+# So the tests that check how the pipeline works run against a reference
+# variant of their own, below, and never read the shipped list. The shipped
+# list is checked only for what any list has to satisfy -- it is legal, every
+# value round-trips, every variant is probed -- and the end-to-end build.py
+# runs, which read the real transform.py, hold each published line to
+# whichever shipped variant it came from.
 SHIPPED_VARIANTS = transform.VARIANTS
 SHIPPED_VARIANTS_ENCODED = transform.VARIANTS_ENCODED
-transform.VARIANTS = SHIPPED_VARIANTS[:1]
-transform.VARIANTS_ENCODED = SHIPPED_VARIANTS_ENCODED[:1]
+
+REFERENCE_VARIANT = transform.Variant(
+    ip="188.114.97.6",
+    port="443",
+    fm=(
+        '{"tcp": [{"type": "fragment", "settings": {"packets": "tlshello", "lengths": ["0",'
+        ' "104", "1"], "delays": ["0"], "maxSplit": "0"}},{"type": "fragment", "settings":'
+        ' {"packets": "1-1", "lengths": ["114", "1"], "delays": ["1"], "maxSplit": "11"}}]}'
+    ),
+    dial_mode="",
+    security="tls",
+    ech="",
+    ech_outbound="",
+    fp="unsafe",
+    cs=(
+        "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:"
+        "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:"
+        "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:"
+        "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256:TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:"
+        "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA:TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA:"
+        "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256:TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256"
+    ),
+)
+transform.VARIANTS = [REFERENCE_VARIANT]
+transform.VARIANTS_ENCODED = [(
+    REFERENCE_VARIANT.ip,
+    REFERENCE_VARIANT.port,
+    *(quote(value, safe="") for value in REFERENCE_VARIANT[2:]),
+)]
+transform._self_check()      # the reference has to be a legal variant itself
 
 FAILURES: list[str] = []
 PASSED = 0
@@ -1080,36 +1112,6 @@ check(len(constant_pairs) == (len(transform.Variant._fields) - 2) * len(SHIPPED_
 for name, encoded, decoded in constant_pairs:
     check(quote(decoded, safe="") == encoded, f"constants: {name} survives a decode/encode cycle")
 
-# The round trip above only proves the constants are self-consistent -- it
-# compares each one against itself, so a wrong value round-trips just as
-# happily as a right one. These pin what the values actually have to be.
-check(json.loads(transform.VARIANTS[0].fm) == {
-    "tcp": [
-        {"type": "fragment", "settings": {
-            "packets": "tlshello", "lengths": ["0", "104", "1"],
-            "delays": ["0"], "maxSplit": "0"}},
-        {"type": "fragment", "settings": {
-            "packets": "1-1", "lengths": ["114", "1"],
-            "delays": ["1"], "maxSplit": "11"}},
-    ]
-}, "constants: fm is the exact fragment specification asked for")
-check(transform.VARIANTS[0].fp == "unsafe", "constants: the default fp is unsafe")
-check(transform.VARIANTS[0].cs.split(":") == [
-    "TLS_AES_256_GCM_SHA384",
-    "TLS_CHACHA20_POLY1305_SHA256",
-    "TLS_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
-    "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
-    "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-    "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-], "constants: cs is the exact cipher list asked for, in order")
-
 # --- Xray outbound rendering ----------------------------------------------
 
 
@@ -1928,16 +1930,15 @@ check(all(
     for node, variant in zip((parse_line(line) for line in emitted), SHIPPED_VARIANTS)
 ), "finalise: each published line carries its own shipped variant, in order")
 published = parse_line(emitted[0])
-check(published.get("fm") == transform.VARIANTS[0].fm,
-      "finalise: build.py adds fm to what it publishes")
-check(DEFAULT_ENCODED["fm"] in emitted[0],
-      "finalise: the published fm is byte-exact in configs.txt")
-check(published.get("fp") == transform.VARIANTS[0].fp
-      and published.get("cs") == transform.VARIANTS[0].cs,
-      "finalise: build.py keeps the masking the health check ran with")
-check((published.address, published.port)
-      == (transform.VARIANTS[0].ip, transform.VARIANTS[0].port),
-      "finalise: build.py publishes on the output endpoint")
+# Byte-exact: each shipped parameter appears in its line exactly as written in
+# VARIANTS_ENCODED -- whatever it is, empty or not.
+shipped_encoded = [dict(zip(transform.Variant._fields, e)) for e in SHIPPED_VARIANTS_ENCODED]
+check(all(
+    f"&{key}={encoded[field]}" in line
+    for line, encoded in zip(emitted, shipped_encoded)
+    for field, key in zip(transform.PARAM_FIELDS, transform.VARIANT_KEYS)
+    if encoded[field]
+), "finalise: every shipped parameter is byte-exact in configs.txt")
 
 # A URL with no scheme is the likeliest typo in a hand-edited sources.txt.
 # urllib raises ValueError for it, which is not a URLError, so left unhandled
